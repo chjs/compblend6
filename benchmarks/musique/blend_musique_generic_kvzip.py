@@ -109,6 +109,7 @@ MAX_NEW_TOKENS = 32
 KVZIP_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_KVZIP_RATIOS", "0.5,0.4,0.3,0.2,0.1").split(",") if x.strip()]
 RECOMP_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_RECOMP_RATIOS", "0.2,0.15,0.1,0.05").split(",") if x.strip()]
 GATE_PCT = float(os.environ.get("COMPBLEND_GATE_PCT", "0.5"))
+BUDGET_MODE = os.environ.get("COMPBLEND_BUDGET_MODE", "per_chunk")   # per_chunk | global
 DEEP_LO = int(os.environ.get("COMPBLEND_DEEP_LO", "15"))
 DEEP_HI = int(os.environ.get("COMPBLEND_DEEP_HI", "31"))
 OUT = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "blend_musique_kvzip.json")))
@@ -174,25 +175,47 @@ def _greedy_decode(model, tokenizer, prefill_logits, past_kv, device):
 
 
 # ── KVzip token pruning ──────────────────────────────────────────────────────
-def _token_prune(cmp: CompressedChunk, keep_ratio: float) -> CompressedChunk:
-    """Keep the top `keep_ratio` fraction of tokens by mean (over layers,heads)
-    importance; drop the rest. Head-uniform → valid_mask becomes all-True."""
-    n = cmp.chunk_len
-    k = max(1, min(n, int(round(n * keep_ratio))))
-    imp_tok = cmp.importance.float().mean(dim=(0, 1))          # [chunk_len]
-    keep = torch.sort(torch.topk(imp_tok, k).indices).values   # sorted positions
+def _subset_chunk(cmp: CompressedChunk, keep) -> CompressedChunk:
+    """Return a CompressedChunk restricted to the (sorted) token indices `keep`.
+    Head-uniform → valid_mask becomes all-True for the kept tokens."""
+    keep = torch.as_tensor(keep, dtype=torch.long)
     keep_list = keep.tolist()
     nl = cmp.num_layers
     return dataclasses.replace(
         cmp,
-        chunk_id=cmp.chunk_id + f":keep{k}",
+        chunk_id=cmp.chunk_id + f":keep{len(keep_list)}",
         token_ids=[cmp.token_ids[i] for i in keep_list],
         key_cache=[cmp.key_cache[li][:, keep, :].contiguous() for li in range(nl)],
         value_cache=[cmp.value_cache[li][:, keep, :].contiguous() for li in range(nl)],
-        valid_mask=torch.ones_like(cmp.valid_mask[:, :, keep]),  # all-True (kept fully)
+        valid_mask=torch.ones_like(cmp.valid_mask[:, :, keep]),
         importance=cmp.importance[:, :, keep].contiguous(),
         is_structural=cmp.is_structural[keep].contiguous(),
     )
+
+
+def _token_prune(cmp: CompressedChunk, keep_ratio: float) -> CompressedChunk:
+    """PER-CHUNK budget: keep the top `keep_ratio` of THIS chunk's tokens by importance."""
+    n = cmp.chunk_len
+    k = max(1, min(n, int(round(n * keep_ratio))))
+    imp_tok = cmp.importance.float().mean(dim=(0, 1))
+    keep = torch.sort(torch.topk(imp_tok, k).indices).values
+    return _subset_chunk(cmp, keep)
+
+
+def _global_budget_prune(cmps: list, keep_ratio: float) -> list:
+    """GLOBAL budget across doc chunks: pool all doc tokens, keep the global top
+    (keep_ratio × total) by importance — high-importance chunks get more tokens,
+    low ones may get few/none (None = chunk fully dropped). Same total token budget."""
+    imps = [c.importance.float().mean(dim=(0, 1)) for c in cmps]      # per-chunk [len]
+    allimp = torch.cat(imps)
+    N = int(allimp.numel())
+    K = max(1, int(round(N * keep_ratio)))
+    thresh = torch.topk(allimp, K).values.min()                      # K-th largest value
+    out = []
+    for c, imp in zip(cmps, imps):
+        keep = torch.sort((imp >= thresh).nonzero(as_tuple=True)[0]).values
+        out.append(_subset_chunk(c, keep) if keep.numel() > 0 else None)
+    return out
 
 
 def _entry_chunk(cmp: CompressedChunk) -> Chunk:
@@ -217,7 +240,7 @@ def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="chec
 
 def main() -> int:
     print(f"[kvzip] model={MODEL} dtype={DTYPE} check_layer={CHECK_LAYER} "
-          f"kvzip_ratios={KVZIP_RATIOS} recomp={RECOMP_RATIOS} deep=[{DEEP_LO},{DEEP_HI})", flush=True)
+          f"kvzip_ratios={KVZIP_RATIOS} recomp={RECOMP_RATIOS} deep=[{DEEP_LO},{DEEP_HI}) budget={BUDGET_MODE}", flush=True)
     lw = LayerwiseModel(MODEL, dtype=DTYPE, attn_implementation=ATTN_IMPL)
     tokenizer, model, device = lw.tokenizer, lw.model, lw.device
     user_open, assistant_open = _resolve_wrapper(MODEL, tokenizer)
@@ -287,16 +310,24 @@ def main() -> int:
 
         # ---- per kvzip ratio: token-prune doc chunks ----
         for r in KVZIP_RATIOS:
-            pruned = {}
-            for ci, c in enumerate(chunks):
-                if doc_slice.start <= ci < doc_slice.stop:
-                    pruned[ci] = _token_prune(cmp_full[c.chunk_id], r)
-                else:
-                    pruned[ci] = cmp_full[c.chunk_id]
-            pchunks = [_entry_chunk(pruned[ci]) for ci in range(len(chunks))]
-            kv_r = KVStore()
+            # compress doc chunks at keep-ratio r: PER-CHUNK (uniform) or GLOBAL budget.
+            doc_cmps = [cmp_full[chunks[ci].chunk_id] for ci in range(doc_slice.start, doc_slice.stop)]
+            if BUDGET_MODE == "global":
+                doc_pruned = _global_budget_prune(doc_cmps, r)   # may contain None (dropped chunk)
+            else:
+                doc_pruned = [_token_prune(c, r) for c in doc_cmps]
+            # assemble fused chunk list + kv store, skipping fully-dropped doc chunks
+            pchunks = []; kv_r = KVStore(); di = 0
             for ci in range(len(chunks)):
-                kv_r._cache[pchunks[ci].chunk_id] = to_kvstore_entry(pruned[ci])
+                if doc_slice.start <= ci < doc_slice.stop:
+                    pr = doc_pruned[di]; di += 1
+                    if pr is None:
+                        continue
+                else:
+                    pr = cmp_full[chunks[ci].chunk_id]
+                ch = _entry_chunk(pr)
+                pchunks.append(ch)
+                kv_r._cache[ch.chunk_id] = to_kvstore_entry(pr)
 
             # full_reuse_kvzip: reuse surviving tokens' KV, recompute=0
             out, fb = _run_compblend(lw, pchunks, kv_r, "hkvd_only", 0.0)
@@ -324,7 +355,7 @@ def main() -> int:
     summary = {
         "config": {"model": MODEL, "n": len(eval_dataset), "check_layer": CHECK_LAYER,
                    "kvzip_ratios": KVZIP_RATIOS, "recompute_ratios": RECOMP_RATIOS,
-                   "gate_percentile": GATE_PCT, "deep_band": [DEEP_LO, DEEP_HI],
+                   "gate_percentile": GATE_PCT, "deep_band": [DEEP_LO, DEEP_HI], "budget_mode": BUDGET_MODE,
                    "max_new_tokens": MAX_NEW_TOKENS, "metric": "token_f1",
                    "per_head_mask_fallback_total": fb_total},
         "f1_mean": means,
