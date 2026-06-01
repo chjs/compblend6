@@ -66,6 +66,12 @@ OUT = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "importance_vs_r
 VIZ_DIR = Path(os.environ.get("COMPBLEND_VIZ_DIR", str(_REPO / "logs" / "imp_vs_reuse_viz")))
 N_VIZ = int(os.environ.get("COMPBLEND_N_VIZ", "4"))     # # questions to render overlay plots for
 TOPK = [0.50, 0.15]   # 0.50 = the KVzip 50% keep-set; 0.15 = the HKVD recompute regime
+# Per-head aggregation of importance/D into a per-token scalar. "none" = raw mean over
+# heads (a high-magnitude head can dominate); "rank" = rank-normalize each head across
+# tokens to [0,1] THEN mean (scale-fair, outlier-robust — e.g. tames imp4's sink spike).
+# Rank metrics (Spearman/overlap) are invariant to monotone transforms of the final
+# per-token vector, but DO depend on this head-combination choice — hence the option.
+HEAD_NORM = os.environ.get("COMPBLEND_HEAD_NORM", "none")
 
 PREFIX_PROMPT = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
 QUERY_PROMPT = "\n\nAnswer the question directly based on the given passages. Do NOT repeat the question. The answer should be within 5 words. \nQuestion:"
@@ -103,6 +109,15 @@ def _spearman(x, y):
     rx -= rx.mean(); ry -= ry.mean()
     d = np.sqrt((rx ** 2).sum()) * np.sqrt((ry ** 2).sum())
     return float((rx * ry).sum() / d) if d > 0 else np.nan
+
+
+def _head_agg(mat, mode):
+    """Combine a [seq, H] per-(token,head) matrix into a [seq] per-token vector."""
+    if mode == "rank":
+        seq = mat.shape[0]
+        r = mat.argsort(0).argsort(0).astype(np.float64) / max(seq - 1, 1)   # per-head rank → [0,1]
+        return r.mean(1)
+    return mat.mean(1)
 
 
 def _overlap(a, b, frac):
@@ -176,14 +191,17 @@ def main() -> int:
         local_pos = np.array(local_pos)
 
         for L in range(n_layers):
-            # K1, K2: [seq, H, Dh] pre-RoPE
+            # K1, K2: [seq, H, Dh] pre-RoPE → per-(token,head) deviation [seq, H]
             K1 = cw.key_cache[L].view(seq, H, Dh).float().numpy()
             K2 = np.concatenate([cc[ci].key_cache[L].view(cc[ci].chunk_len, H, Dh).float().numpy()
                                  for ci in range(len(chunks))], axis=0)
-            D = np.sqrt(((K1 - K2) ** 2).sum(-1)).mean(1)          # [seq] mean over heads
-            imp3 = cw.importance[L].float().numpy().mean(0)        # [seq] mean over heads
-            imp4 = np.concatenate([cc[ci].importance[L].float().numpy().mean(0)
-                                   for ci in range(len(chunks))], axis=0)
+            Dmat = np.sqrt(((K1 - K2) ** 2).sum(-1))               # [seq, H]
+            imp3mat = cw.importance[L].float().numpy().T           # [seq, H]
+            imp4mat = np.concatenate([cc[ci].importance[L].float().numpy()
+                                      for ci in range(len(chunks))], axis=1).T   # [seq, H]
+            D = _head_agg(Dmat, HEAD_NORM)                         # [seq] per-token (head-combined)
+            imp3 = _head_agg(imp3mat, HEAD_NORM)
+            imp4 = _head_agg(imp4mat, HEAD_NORM)
             acc["sp_D_imp3"][L].append(_spearman(D, imp3))
             acc["sp_D_imp4"][L].append(_spearman(D, imp4))
             acc["sp_imp3_imp4"][L].append(_spearman(imp3, imp4))
@@ -215,6 +233,7 @@ def main() -> int:
         return [float(np.nanmean(acc[key][L])) for L in range(n_layers)]
 
     summary = {"config": {"model": MODEL, "n": len(data), "n_layers": n_layers, "kvzip_keep": 0.5,
+                          "head_norm": HEAD_NORM,
                           "note": "compressed at ratio=1.0 (clean K/scores); 50% applied as analysis threshold"},
                "per_layer": {k: per_layer(k) for k in acc},
                "layer_mean": {k: float(np.nanmean([np.nanmean(acc[k][L]) for L in range(n_layers)])) for k in acc},
