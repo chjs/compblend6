@@ -1,0 +1,231 @@
+"""Does KVzip importance predict where chunk-KV reuse breaks? (MuSiQue)
+
+Computes four objects per question, all aligned on the SAME fused token sequence:
+
+  1. full-prefill pre-RoPE K   — compress the WHOLE prompt (full context).      [KV]
+  2. per-chunk isolated K      — compress each chunk alone, concatenate.        [KV]
+  3. importance_full           — KVzip importance from the whole-prompt compress. [score]
+  4. importance_chunk          — KVzip importance from the per-chunk compress.    [score]
+
+The reuse-error / "needs-recompute" ground truth is the per-token K deviation
+    D(t) = mean_head || K1(t) - K2(t) ||      (per layer; pre-RoPE).
+We then ask: does importance (3 or 4) line up with D, and which is more appropriate?
+
+Metrics (per layer, averaged over questions):
+  - spearman(D, imp3), spearman(D, imp4), spearman(imp3, imp4)
+  - top-50% overlap(D, imp3/imp4)  — the 50% KVzip keep-set vs the top-50% high-D set
+  - top-15% overlap                — the HKVD recompute regime
+  - intra-chunk local-position means of D / imp3 / imp4 (sink artifact at pos 0)
+
+IMPORTANT on the "50% ratio": KVzip prune(0.5) zero-fills evicted K and zeroes evicted
+importance (sentinel) — that would corrupt the K1-vs-K2 deviation and the score ranking.
+Importance/K are ratio-independent before thresholding, and prune(0.5) keeps exactly the
+top-50% by score. So we compress WITHOUT eviction (ratio=1.0 → clean K + raw scores) and
+apply 50% as the analysis threshold — identical keep-set, valid comparison.
+
+Env: CACHEBLEND_MODEL (default Llama-3.1-8B-Instruct), CACHEBLEND_MUSIQUE_N (default all),
+     COMPBLEND_OUT. Run: python benchmarks/musique/importance_vs_reuse.py
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+# ── bootstrap (load musique utils by path; keep KVzip's `utils` package unshadowed) ──
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[1]
+
+
+def _load_by_path(name, path):
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+
+
+_mq = _load_by_path("_musique_utils", _HERE / "utils.py")
+load_dataset, build_qa_prompt = _mq.load_dataset, _mq.build_qa_prompt
+sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != _HERE]
+for _p in (str(_REPO / "src"), str(_REPO / "src/external/cacheblend-hf-v7/src"),
+           str(_REPO / "src/external/KVzip")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+os.chdir(_HERE)
+
+from cacheblend import LayerwiseModel
+from cacheblend.chunker import Chunk, _stable_id
+from compblend.backends.base import CompressionBudget
+
+MODEL = os.environ.get("CACHEBLEND_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+DTYPE = os.environ.get("CACHEBLEND_DTYPE", "bfloat16")
+OUT = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "importance_vs_reuse.json")))
+TOPK = [0.50, 0.15]   # 0.50 = the KVzip 50% keep-set; 0.15 = the HKVD recompute regime
+
+PREFIX_PROMPT = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
+QUERY_PROMPT = "\n\nAnswer the question directly based on the given passages. Do NOT repeat the question. The answer should be within 5 words. \nQuestion:"
+_WRAP = {"llama-3": ("<|start_header_id|>user<|end_header_id|>\n\n",
+                     "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"),
+         "llama3": ("<|start_header_id|>user<|end_header_id|>\n\n",
+                    "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"),
+         "mistral": ("[INST]", "[/INST]"), "qwen": ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")}
+
+
+def _wrapper(model_id, tokenizer):
+    for k, w in _WRAP.items():
+        if k in model_id.lower():
+            return w
+    s = "\x00C\x00"; t = tokenizer.apply_chat_template([{"role": "user", "content": s}], tokenize=False, add_generation_prompt=True)
+    pre, post = t.split(s, 1); bos = tokenizer.bos_token or ""
+    return (pre[len(bos):] if pre.startswith(bos) else pre), post
+
+
+def _build_chunks(tokenizer, texts):
+    bos = tokenizer.bos_token_id; out = []
+    for i, t in enumerate(texts):
+        ids = tokenizer(t, add_special_tokens=False)["input_ids"]
+        if i == 0 and bos is not None:
+            ids = [bos] + ids
+        out.append(Chunk(text=t, token_ids=ids, chunk_id=_stable_id(t, ids)))
+    return out
+
+
+def _spearman(x, y):
+    n = len(x)
+    if n < 3:
+        return np.nan
+    rx = x.argsort().argsort().astype(np.float64); ry = y.argsort().argsort().astype(np.float64)
+    rx -= rx.mean(); ry -= ry.mean()
+    d = np.sqrt((rx ** 2).sum()) * np.sqrt((ry ** 2).sum())
+    return float((rx * ry).sum() / d) if d > 0 else np.nan
+
+
+def _overlap(a, b, frac):
+    k = max(1, int(round(len(a) * frac)))
+    sa = set(np.argsort(-a)[:k].tolist()); sb = set(np.argsort(-b)[:k].tolist())
+    return len(sa & sb) / k
+
+
+def main() -> int:
+    print(f"[imp_vs_reuse] model={MODEL}", flush=True)
+    os.environ["COMPBLEND_KVZIP_NO_SYS_PROMPT"] = "1"   # no injected sink; scope is the only variable
+    lw = LayerwiseModel(MODEL, dtype=DTYPE, attn_implementation="sdpa")
+    tokenizer = lw.tokenizer
+    from compblend.backends.kvzip import KVzipBackend, KVzipConfig
+    backend = KVzipBackend(MODEL, KVzipConfig(kv_type="retain", level="pair"))
+    hf_model = backend.hf_model
+    device = next(hf_model.parameters()).device
+    cfg = hf_model.config
+    H = cfg.num_key_value_heads
+    Dh = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+    user_open, asst_open = _wrapper(MODEL, tokenizer)
+
+    data = load_dataset("inputs/musique_s.json")
+    n_env = os.environ.get("CACHEBLEND_MUSIQUE_N")
+    if n_env:
+        data = data[:int(n_env)]
+    print(f"[imp_vs_reuse] {len(data)} examples", flush=True)
+
+    def compress(ids):
+        t = torch.tensor([ids], dtype=torch.long, device=device)
+        return backend.compress(t, model=hf_model, budget=CompressionBudget(ratio=1.0)).to("cpu")
+
+    n_layers = None
+    # per-layer accumulators (lists over questions)
+    acc = {"sp_D_imp3": [], "sp_D_imp4": [], "sp_imp3_imp4": []}
+    for f in TOPK:
+        acc[f"ov{int(f*100)}_D_imp3"] = []
+        acc[f"ov{int(f*100)}_D_imp4"] = []
+    pos_buckets = {k: {p: [] for p in [0, 1, 2, 3, 4, "rest"]} for k in ("D", "imp3", "imp4")}
+
+    for qi, ex in enumerate(data):
+        doc_prompts, q_prompt = build_qa_prompt(ex, QUERY_PROMPT)
+        texts = [user_open + PREFIX_PROMPT] + list(doc_prompts) + [q_prompt + asst_open]
+        chunks = _build_chunks(tokenizer, texts)
+        fused_ids = [t for c in chunks for t in c.token_ids]
+        doc_idx = list(range(1, 1 + len(doc_prompts)))
+
+        cw = compress(fused_ids)                                   # whole-prompt
+        cc = [compress(c.token_ids) for c in chunks]               # per-chunk
+        seq = len(fused_ids)
+        if sum(c.chunk_len for c in cc) != seq or cw.chunk_len != seq:
+            print(f"[Q{qi+1} skip] length mismatch", flush=True); continue
+        if n_layers is None:
+            n_layers = cw.num_layers
+            for key in list(acc):
+                acc[key] = [[] for _ in range(n_layers)]
+
+        # per-chunk local-position index for each fused token (for sink buckets); -1 = non-doc
+        local_pos = []
+        for ci, c in enumerate(chunks):
+            for j in range(c.chunk_len):
+                local_pos.append(j if ci in doc_idx else -1)
+        local_pos = np.array(local_pos)
+
+        for L in range(n_layers):
+            # K1, K2: [seq, H, Dh] pre-RoPE
+            K1 = cw.key_cache[L].view(seq, H, Dh).float().numpy()
+            K2 = np.concatenate([cc[ci].key_cache[L].view(cc[ci].chunk_len, H, Dh).float().numpy()
+                                 for ci in range(len(chunks))], axis=0)
+            D = np.sqrt(((K1 - K2) ** 2).sum(-1)).mean(1)          # [seq] mean over heads
+            imp3 = cw.importance[L].float().numpy().mean(0)        # [seq] mean over heads
+            imp4 = np.concatenate([cc[ci].importance[L].float().numpy().mean(0)
+                                   for ci in range(len(chunks))], axis=0)
+            acc["sp_D_imp3"][L].append(_spearman(D, imp3))
+            acc["sp_D_imp4"][L].append(_spearman(D, imp4))
+            acc["sp_imp3_imp4"][L].append(_spearman(imp3, imp4))
+            for f in TOPK:
+                acc[f"ov{int(f*100)}_D_imp3"][L].append(_overlap(D, imp3, f))
+                acc[f"ov{int(f*100)}_D_imp4"][L].append(_overlap(D, imp4, f))
+            # intra-chunk position buckets (use a mid-deep layer L≈n//2 only, to keep it cheap+representative)
+            if L == n_layers // 2:
+                for arr, key in ((D, "D"), (imp3, "imp3"), (imp4, "imp4")):
+                    a = arr.copy()
+                    if a.std() > 0:
+                        a = (a - a.mean()) / a.std()               # z-score within question for comparability
+                    for p in [0, 1, 2, 3, 4]:
+                        v = a[local_pos == p]
+                        if len(v):
+                            pos_buckets[key][p].append(float(v.mean()))
+                    v = a[local_pos >= 5]
+                    if len(v):
+                        pos_buckets[key]["rest"].append(float(v.mean()))
+        if (qi + 1) % 10 == 0 or qi == 0:
+            print(f"[{qi+1}/{len(data)}] L{n_layers//2}: sp(D,imp3)={np.nanmean(acc['sp_D_imp3'][n_layers//2]):.3f} "
+                  f"sp(D,imp4)={np.nanmean(acc['sp_D_imp4'][n_layers//2]):.3f}", flush=True)
+
+    def per_layer(key):
+        return [float(np.nanmean(acc[key][L])) for L in range(n_layers)]
+
+    summary = {"config": {"model": MODEL, "n": len(data), "n_layers": n_layers, "kvzip_keep": 0.5,
+                          "note": "compressed at ratio=1.0 (clean K/scores); 50% applied as analysis threshold"},
+               "per_layer": {k: per_layer(k) for k in acc},
+               "layer_mean": {k: float(np.nanmean([np.nanmean(acc[k][L]) for L in range(n_layers)])) for k in acc},
+               "intra_chunk_pos_zscore": {k: {str(p): (float(np.nanmean(v)) if v else None)
+                                              for p, v in pos_buckets[k].items()} for k in pos_buckets}}
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(summary, indent=2))
+
+    print("\n──────── importance vs reuse-error (D = ||K1-K2||) ────────", flush=True)
+    print("layer-mean Spearman / overlap:", flush=True)
+    for k, v in summary["layer_mean"].items():
+        print(f"   {k:16s} {v:+.3f}", flush=True)
+    print("\nper-layer Spearman(D, imp3 full / imp4 chunk):", flush=True)
+    sp3, sp4 = per_layer("sp_D_imp3"), per_layer("sp_D_imp4")
+    for L in range(0, n_layers, max(1, n_layers // 16)):
+        print(f"   L{L:2d}: imp3 {sp3[L]:+.3f}   imp4 {sp4[L]:+.3f}", flush=True)
+    print("\nintra-chunk position (z-scored, mid layer):", flush=True)
+    for k in ("D", "imp3", "imp4"):
+        row = summary["intra_chunk_pos_zscore"][k]
+        print(f"   {k:5s} " + "  ".join(f"p{p}={row[str(p)]:+.2f}" if row.get(str(p)) is not None else f"p{p}=NA"
+                                        for p in [0, 1, 2, 3, 4, "rest"]), flush=True)
+    print(f"\n[imp_vs_reuse] wrote {OUT}", flush=True)
+    print("IMP_VS_REUSE_DONE", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
