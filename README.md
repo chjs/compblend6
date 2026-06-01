@@ -22,9 +22,8 @@ Compressed KV cache blending. Uses `cacheblend-hf-v7` as the CacheBlend core
 
   | arm | meaning |
   |---|---|
-  | `full_prefill` | uncompressed chunks → full prefill (ceiling) |
+  | `full_prefill` | uncompressed chunks → full prefill — CacheBlend-paper roofline |
   | `full_reuse` | uncompressed per-chunk KV → reuse, no recompute |
-  | `full_prefill_kvzip` | token-pruned chunks → full prefill of survivors |
   | `full_reuse_kvzip` | token-pruned per-chunk KV → reuse, no recompute |
   | `only_hkvd` | pruned chunks → HKVD top-k selective recompute |
   | `gated_all_hkvd` | + importance gate (mean over ALL layers) then HKVD |

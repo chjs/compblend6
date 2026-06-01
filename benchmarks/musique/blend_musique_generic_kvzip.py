@@ -15,18 +15,19 @@ ever needed (sidesteps the H2 per-head-mask blow-up).
 
 Arms compared (all share the dataset / prompt / chunking / token-F1 of the original)
 ------------------------------------------------------------------------------------
-  full_prefill        uncompressed chunks recombined → full prefill (gold ceiling).
+  full_prefill        uncompressed chunks recombined → full prefill. This is the
+                      CacheBlend-paper "full prefill" — the best-score ROOFLINE.
   full_reuse          uncompressed per-chunk KV recombined → reuse, NO recompute.
-  full_prefill_kvzip  KVzip-token-pruned chunks recombined → full prefill of the
-                      surviving tokens.
   full_reuse_kvzip    KVzip-token-pruned per-chunk KV recombined → reuse, NO recompute.
   only_hkvd           pruned chunks → HKVD top-k selective recompute (CacheBlend).
   gated_all_hkvd      pruned chunks → importance gate (mean over ALL layers) then HKVD.
   gated_deep_hkvd     pruned chunks → importance gate (mean over layers 15..30) then HKVD.
 
-full_prefill / full_reuse are kvzip-ratio independent (computed once). full_*_kvzip
-are recompute-ratio independent (one per kvzip ratio). The 3 blending arms run over
-the full kvzip_ratio × recompute_ratio grid.
+full_prefill / full_reuse are kvzip-ratio independent (computed once). full_reuse_kvzip
+is recompute-ratio independent (one per kvzip ratio). The 3 blending arms run over the
+full kvzip_ratio × recompute_ratio grid. (A `prefill_kvzip` arm — full-prefill of the
+token-pruned survivors — was intentionally dropped: full-prefilling a token-depleted
+context is not a meaningful upper bound; `full_prefill` is the roofline.)
 
 Env vars (superset of blend_musique_generic.py):
     CACHEBLEND_MODEL         HF model id (default meta-llama/Llama-3.1-8B-Instruct)
@@ -230,7 +231,6 @@ def main() -> int:
     # score accumulators
     f1 = {"full_prefill": [], "full_reuse": []}
     for r in KVZIP_RATIOS:
-        f1[f"full_prefill_kvzip@{r}"] = []
         f1[f"full_reuse_kvzip@{r}"] = []
         for rr in RECOMP_RATIOS:
             for arm in ("only_hkvd", "gated_all_hkvd", "gated_deep_hkvd"):
@@ -281,13 +281,6 @@ def main() -> int:
             for ci in range(len(chunks)):
                 kv_r._cache[pchunks[ci].chunk_id] = to_kvstore_entry(pruned[ci])
 
-            # full_prefill_kvzip: recompute surviving tokens from scratch
-            out = fuse_full_recompute(lw, pchunks, return_layerwise_output=True)
-            res = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device)
-            f1[f"full_prefill_kvzip@{r}"].append(max(compute_f1(res, a, tokenizer) for a in answers))
-            del out
-            if device.type == "cuda": torch.cuda.empty_cache()
-
             # full_reuse_kvzip: reuse surviving tokens' KV, recompute=0
             out, fb = _run_compblend(lw, pchunks, kv_r, "hkvd_only", 0.0)
             fb_total += fb
@@ -326,9 +319,9 @@ def main() -> int:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, indent=2))
     print("\n──────── blend_musique_kvzip ────────", flush=True)
-    print(f"full_prefill = {means['full_prefill']:.4f}   full_reuse = {means['full_reuse']:.4f}   (fb={fb_total})", flush=True)
+    print(f"ROOFLINE full_prefill = {means['full_prefill']:.4f}   full_reuse = {means['full_reuse']:.4f}   (fb={fb_total})", flush=True)
     for r in KVZIP_RATIOS:
-        print(f"\n kvzip_ratio={r}:  prefill_kvzip={means[f'full_prefill_kvzip@{r}']:.4f}  reuse_kvzip={means[f'full_reuse_kvzip@{r}']:.4f}", flush=True)
+        print(f"\n kvzip_ratio={r}:  reuse_kvzip={means[f'full_reuse_kvzip@{r}']:.4f}", flush=True)
         for rr in RECOMP_RATIOS:
             row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.4f}"
                             for arm in ("only_hkvd", "gated_all_hkvd", "gated_deep_hkvd"))
