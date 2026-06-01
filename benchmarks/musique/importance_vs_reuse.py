@@ -63,6 +63,8 @@ from compblend.backends.base import CompressionBudget
 MODEL = os.environ.get("CACHEBLEND_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 DTYPE = os.environ.get("CACHEBLEND_DTYPE", "bfloat16")
 OUT = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "importance_vs_reuse.json")))
+VIZ_DIR = Path(os.environ.get("COMPBLEND_VIZ_DIR", str(_REPO / "logs" / "imp_vs_reuse_viz")))
+N_VIZ = int(os.environ.get("COMPBLEND_N_VIZ", "4"))     # # questions to render overlay plots for
 TOPK = [0.50, 0.15]   # 0.50 = the KVzip 50% keep-set; 0.15 = the HKVD recompute regime
 
 PREFIX_PROMPT = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
@@ -140,6 +142,9 @@ def main() -> int:
         acc[f"ov{int(f*100)}_D_imp3"] = []
         acc[f"ov{int(f*100)}_D_imp4"] = []
     pos_buckets = {k: {p: [] for p in [0, 1, 2, 3, 4, "rest"]} for k in ("D", "imp3", "imp4")}
+    viz_examples = []                 # per-question per-token arrays for overlay plots
+    pool = {"D": [], "imp3": [], "imp4": []}   # mid-layer pooled points for scatter
+    viz_layers = None
 
     for qi, ex in enumerate(data):
         doc_prompts, q_prompt = build_qa_prompt(ex, QUERY_PROMPT)
@@ -157,6 +162,11 @@ def main() -> int:
             n_layers = cw.num_layers
             for key in list(acc):
                 acc[key] = [[] for _ in range(n_layers)]
+            viz_layers = sorted({1, n_layers // 2, min(n_layers - 1, 24)})
+        boundaries = list(np.cumsum([c.chunk_len for c in chunks])[:-1])
+        viz_this = (qi < N_VIZ)
+        if viz_this:
+            viz_examples.append({"q": qi, "boundaries": boundaries, "layers": {}})
 
         # per-chunk local-position index for each fused token (for sink buckets); -1 = non-doc
         local_pos = []
@@ -180,6 +190,10 @@ def main() -> int:
             for f in TOPK:
                 acc[f"ov{int(f*100)}_D_imp3"][L].append(_overlap(D, imp3, f))
                 acc[f"ov{int(f*100)}_D_imp4"][L].append(_overlap(D, imp4, f))
+            if viz_this and L in viz_layers:
+                viz_examples[-1]["layers"][L] = (D.copy(), imp3.copy(), imp4.copy())
+            if L == n_layers // 2 and len(pool["D"]) < 80000:
+                pool["D"].extend(D.tolist()); pool["imp3"].extend(imp3.tolist()); pool["imp4"].extend(imp4.tolist())
             # intra-chunk position buckets (use a mid-deep layer L≈n//2 only, to keep it cheap+representative)
             if L == n_layers // 2:
                 for arr, key in ((D, "D"), (imp3, "imp3"), (imp4, "imp4")):
@@ -208,6 +222,55 @@ def main() -> int:
                                               for p, v in pos_buckets[k].items()} for k in pos_buckets}}
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, indent=2))
+
+    # ── visualizations ──
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        VIZ_DIR.mkdir(parents=True, exist_ok=True)
+
+        def _nz(a):
+            r = a.max() - a.min()
+            return (a - a.min()) / r if r > 0 else a * 0.0
+
+        # 1) overlay: D(t) with imp3/imp4 on top, per example & layer
+        for ex in viz_examples:
+            for L, (D, i3, i4) in sorted(ex["layers"].items()):
+                x = np.arange(len(D))
+                fig, axp = plt.subplots(figsize=(15, 3.6))
+                axp.fill_between(x, _nz(D), color="0.82", label="D = ‖K1−K2‖  (reuse error / needs-recompute)")
+                axp.plot(x, _nz(i3), color="C0", lw=1.0, label="imp3  (full-context importance)")
+                axp.plot(x, _nz(i4), color="C1", lw=1.0, label="imp4  (per-chunk importance)")
+                for b in ex["boundaries"]:
+                    axp.axvline(b, color="0.55", ls=":", lw=0.6)
+                axp.set_title(f"Q{ex['q']}  layer {L}  — per-token (each series min-max normalized); dotted = chunk boundaries")
+                axp.set_xlabel("token position"); axp.set_ylabel("normalized"); axp.set_ylim(-0.02, 1.05)
+                axp.legend(loc="upper right", fontsize=8, ncol=3)
+                fig.tight_layout(); fig.savefig(VIZ_DIR / f"overlay_q{ex['q']}_L{L}.png", dpi=110); plt.close(fig)
+
+        # 2) scatter at mid layer: importance vs D
+        Dp = np.array(pool["D"]); i3p = np.array(pool["imp3"]); i4p = np.array(pool["imp4"])
+        fig, axs = plt.subplots(1, 2, figsize=(11, 5), sharey=True)
+        for axx, imp, name in ((axs[0], i3p, "imp3 (full-context)"), (axs[1], i4p, "imp4 (per-chunk)")):
+            axx.scatter(imp, Dp, s=2, alpha=0.12, color="C0", edgecolors="none")
+            axx.set_xlabel(f"{name} importance"); axx.set_title(f"{name}\nSpearman(imp, D) = {_spearman(imp, Dp):+.3f}")
+        axs[0].set_ylabel("D = ‖K1−K2‖ (reuse error)")
+        fig.suptitle(f"mid layer (L{n_layers//2}), pooled over {len(data)} questions ({len(Dp)} tokens)")
+        fig.tight_layout(); fig.savefig(VIZ_DIR / "scatter_midlayer.png", dpi=110); plt.close(fig)
+
+        # 3) per-layer Spearman curve
+        fig, axc = plt.subplots(figsize=(9, 4))
+        axc.plot(range(n_layers), per_layer("sp_D_imp3"), "-o", ms=3, color="C0", label="Spearman(D, imp3 full-context)")
+        axc.plot(range(n_layers), per_layer("sp_D_imp4"), "-s", ms=3, color="C1", label="Spearman(D, imp4 per-chunk)")
+        axc.axhline(0, color="0.6", lw=0.6)
+        axc.set_xlabel("layer"); axc.set_ylabel("Spearman ρ"); axc.legend()
+        axc.set_title("Does KVzip importance predict reuse error D, by layer?")
+        fig.tight_layout(); fig.savefig(VIZ_DIR / "per_layer_spearman.png", dpi=110); plt.close(fig)
+        print(f"[imp_vs_reuse] wrote plots to {VIZ_DIR}", flush=True)
+    except Exception as exc:
+        print(f"[imp_vs_reuse] viz skipped: {type(exc).__name__}: {exc}", flush=True)
 
     print("\n──────── importance vs reuse-error (D = ||K1-K2||) ────────", flush=True)
     print("layer-mean Spearman / overlap:", flush=True)
