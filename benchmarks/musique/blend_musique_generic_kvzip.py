@@ -229,11 +229,19 @@ def main() -> int:
     print(f"[kvzip] {len(eval_dataset)} examples", flush=True)
 
     # score accumulators
+    # blending arms: (name, selector, importance_aggregation). mean vs MAX gate aggregation.
+    BLEND_ARMS = [
+        ("only_hkvd",          "hkvd_only",   "check_layer"),
+        ("gated_all_hkvd",     "gated_top_k", "all_layer"),       # mean over (layer,head)
+        ("gated_all_max_hkvd", "gated_top_k", "all_layer_max"),   # MAX over (layer,head)
+        ("gated_deep_hkvd",    "gated_top_k", "deep"),            # mean over deep layers,head
+        ("gated_deep_max_hkvd","gated_top_k", "deep_max"),        # MAX over deep layers,head
+    ]
     f1 = {"full_prefill": [], "full_reuse": []}
     for r in KVZIP_RATIOS:
         f1[f"full_reuse_kvzip@{r}"] = []
         for rr in RECOMP_RATIOS:
-            for arm in ("only_hkvd", "gated_all_hkvd", "gated_deep_hkvd"):
+            for arm, _s, _a in BLEND_ARMS:
                 f1[f"{arm}@kv{r}_rc{rr}"] = []
     fb_total = 0
 
@@ -291,11 +299,7 @@ def main() -> int:
 
             # blending arms over recompute ratios
             for rr in RECOMP_RATIOS:
-                for arm, sel, agg in (
-                    ("only_hkvd", "hkvd_only", "check_layer"),
-                    ("gated_all_hkvd", "gated_top_k", "all_layer"),
-                    ("gated_deep_hkvd", "gated_top_k", "deep"),
-                ):
+                for arm, sel, agg in BLEND_ARMS:
                     out, fb = _run_compblend(lw, pchunks, kv_r, sel, rr, agg=agg)
                     fb_total += fb
                     res = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device)
@@ -323,8 +327,7 @@ def main() -> int:
     for r in KVZIP_RATIOS:
         print(f"\n kvzip_ratio={r}:  reuse_kvzip={means[f'full_reuse_kvzip@{r}']:.4f}", flush=True)
         for rr in RECOMP_RATIOS:
-            row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.4f}"
-                            for arm in ("only_hkvd", "gated_all_hkvd", "gated_deep_hkvd"))
+            row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.3f}" for arm, _s, _a in BLEND_ARMS)
             print(f"    rc={rr}:  {row}", flush=True)
     print(f"\n[kvzip] wrote {OUT}", flush=True)
     print("BLEND_MUSIQUE_KVZIP_DONE", flush=True)

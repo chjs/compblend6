@@ -652,6 +652,26 @@ def fuse_selective_compblend(
             else:
                 _lo, _hi = _nl // 4, max(_nl // 4 + 1, 3 * _nl // 4)
             chunk_imp_1d = chunk_imp[_lo:_hi].mean(dim=(0, 1))
+        elif config.importance_aggregation in ("all_layer_max", "deep_max"):
+            # MAX over (layer, head): rank-normalize each (layer,head) across tokens to
+            # [0,1] THEN max → a token salient in ANY head/layer scores high (vs mean,
+            # which blurs single-head salience). Per-(layer,head) rank makes it scale-fair.
+            if config.importance_aggregation == "deep_max":
+                _nl = chunk_imp.shape[0]
+                if config.deep_layer_lo is not None or config.deep_layer_hi is not None:
+                    _lo = 0 if config.deep_layer_lo is None else config.deep_layer_lo
+                    _hi = _nl if config.deep_layer_hi is None else config.deep_layer_hi
+                    _lo = max(0, min(_lo, _nl - 1))
+                    _hi = max(_lo + 1, min(_hi, _nl))
+                else:
+                    _lo, _hi = _nl // 4, max(_nl // 4 + 1, 3 * _nl // 4)
+                sel = chunk_imp[_lo:_hi]
+            else:
+                sel = chunk_imp
+            _T = sel.shape[-1]
+            flat = sel.reshape(-1, _T).float()                      # [LH, T]
+            ranks = flat.argsort(dim=1).argsort(dim=1).float() / max(_T - 1, 1)
+            chunk_imp_1d = ranks.max(dim=0).values                  # [T] max over (layer,head)
         else:
             chunk_imp_1d = chunk_imp[config.check_layer].mean(dim=0)
         if config.chunk_normalization == "rank":

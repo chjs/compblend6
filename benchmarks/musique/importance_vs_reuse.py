@@ -143,6 +143,25 @@ def _overlap(a, b, frac):
     return len(sa & sb) / k
 
 
+def _boundary_decomp(gpool, bdec):
+    """Split pooled global rank-max points into chunk-FIRST tokens vs interior, and
+    report Spearman(D, imp) on each + how much of the top-D set is boundary tokens."""
+    D = np.array(gpool["D"]); g3 = np.array(gpool["imp3"]); g4 = np.array(gpool["imp4"])
+    b = np.array(gpool["bound"], dtype=bool)
+    out = {
+        "frac_top15D_is_boundary": float(np.mean(bdec["frac_top15D_is_boundary"])) if bdec["frac_top15D_is_boundary"] else None,
+        "frac_tokens_boundary": float(np.mean(bdec["frac_boundary"])) if bdec["frac_boundary"] else None,
+        "n_boundary": int(b.sum()), "n_interior": int((~b).sum()),
+    }
+    if b.sum() > 3:
+        out["sp_boundary_D_imp3"] = _spearman(D[b], g3[b])
+        out["sp_boundary_D_imp4"] = _spearman(D[b], g4[b])
+    if (~b).sum() > 3:
+        out["sp_interior_D_imp3"] = _spearman(D[~b], g3[~b])
+        out["sp_interior_D_imp4"] = _spearman(D[~b], g4[~b])
+    return out
+
+
 def main() -> int:
     print(f"[imp_vs_reuse] model={MODEL}", flush=True)
     os.environ["COMPBLEND_KVZIP_NO_SYS_PROMPT"] = "1"   # no injected sink; scope is the only variable
@@ -182,7 +201,9 @@ def main() -> int:
     for f in TOPK:
         gacc[f"ov{int(f*100)}_gD_g3"] = []
         gacc[f"ov{int(f*100)}_gD_g4"] = []
-    gpool = {"D": [], "imp3": [], "imp4": []}
+    gpool = {"D": [], "imp3": [], "imp4": [], "bound": []}
+    # boundary test: is the imp4↔D agreement concentrated at chunk-FIRST tokens?
+    bdec = {"frac_top15D_is_boundary": [], "frac_boundary": []}
 
     for qi, ex in enumerate(data):
         doc_prompts, q_prompt = build_qa_prompt(ex, QUERY_PROMPT)
@@ -259,8 +280,16 @@ def main() -> int:
         for f in TOPK:
             gacc[f"ov{int(f*100)}_gD_g3"].append(_overlap(gD, g3, f))
             gacc[f"ov{int(f*100)}_gD_g4"].append(_overlap(gD, g4, f))
+        # boundary mask = first token of EACH chunk (chunk-start positions)
+        bmask = np.zeros(seq, dtype=bool)
+        bmask[[0] + boundaries] = True
+        kD = max(1, int(round(seq * 0.15)))
+        topD = set(np.argsort(-gD)[:kD].tolist())
+        bdec["frac_top15D_is_boundary"].append(len(topD & set(np.where(bmask)[0].tolist())) / kD)
+        bdec["frac_boundary"].append(float(bmask.mean()))
         if len(gpool["D"]) < 80000:
-            gpool["D"].extend(gD.tolist()); gpool["imp3"].extend(g3.tolist()); gpool["imp4"].extend(g4.tolist())
+            gpool["D"].extend(gD.tolist()); gpool["imp3"].extend(g3.tolist())
+            gpool["imp4"].extend(g4.tolist()); gpool["bound"].extend(bmask.tolist())
         if (qi + 1) % 10 == 0 or qi == 0:
             print(f"[{qi+1}/{len(data)}] L{n_layers//2}: sp(D,imp3)={np.nanmean(acc['sp_D_imp3'][n_layers//2]):.3f} "
                   f"sp(D,imp4)={np.nanmean(acc['sp_D_imp4'][n_layers//2]):.3f} | "
@@ -275,6 +304,7 @@ def main() -> int:
                "per_layer": {k: per_layer(k) for k in acc},
                "layer_mean": {k: float(np.nanmean([np.nanmean(acc[k][L]) for L in range(n_layers)])) for k in acc},
                "global_rankmax": {k: float(np.nanmean(v)) for k, v in gacc.items()},
+               "boundary_decomp": _boundary_decomp(gpool, bdec),
                "intra_chunk_pos_zscore": {k: {str(p): (float(np.nanmean(v)) if v else None)
                                               for p, v in pos_buckets[k].items()} for k in pos_buckets}}
     OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -343,6 +373,9 @@ def main() -> int:
     print(f"GLOBAL rank-MAX over (layer,head)  [head_norm={HEAD_NORM} for per-layer below]:", flush=True)
     for k, v in summary["global_rankmax"].items():
         print(f"   {k:16s} {v:+.3f}", flush=True)
+    print("BOUNDARY decomposition (chunk-first tokens vs interior):", flush=True)
+    for k, v in summary["boundary_decomp"].items():
+        print(f"   {k:26s} {v}", flush=True)
     print("layer-mean Spearman / overlap:", flush=True)
     for k, v in summary["layer_mean"].items():
         print(f"   {k:16s} {v:+.3f}", flush=True)

@@ -29,6 +29,9 @@ ImportanceAggregation = Literal[
     "check_layer",   # current default — importance at check_layer only, mean over heads
     "all_layer",     # CompBlend-old style — mean over ALL layers AND heads (H3 ablation)
     "deep",          # mean over DEEP layers [L//4, 3L//4) and heads (where imp↔dev corr is strongest)
+    "all_layer_max", # MAX over ALL (layer, head): per-(layer,head) rank-normalized then max —
+                     # "salient in ANY head/layer" (avoids the mean's blur of single-head salience)
+    "deep_max",      # same MAX reduction but over DEEP layers only
 ]
 
 
@@ -112,7 +115,8 @@ class CompBlendConfig:
             raise ValueError(
                 f"unknown chunk_normalization: {self.chunk_normalization!r}"
             )
-        if self.importance_aggregation not in ("check_layer", "all_layer", "deep"):
+        if self.importance_aggregation not in ("check_layer", "all_layer", "deep",
+                                               "all_layer_max", "deep_max"):
             raise ValueError(
                 f"unknown importance_aggregation: {self.importance_aggregation!r}"
             )
