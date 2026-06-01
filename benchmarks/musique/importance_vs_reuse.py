@@ -163,7 +163,7 @@ def main() -> int:
             for key in list(acc):
                 acc[key] = [[] for _ in range(n_layers)]
             viz_layers = sorted({1, n_layers // 2, min(n_layers - 1, 24)})
-        boundaries = list(np.cumsum([c.chunk_len for c in chunks])[:-1])
+        boundaries = list(np.cumsum([len(c.token_ids) for c in chunks])[:-1])
         viz_this = (qi < N_VIZ)
         if viz_this:
             viz_examples.append({"q": qi, "boundaries": boundaries, "layers": {}})
@@ -171,7 +171,7 @@ def main() -> int:
         # per-chunk local-position index for each fused token (for sink buckets); -1 = non-doc
         local_pos = []
         for ci, c in enumerate(chunks):
-            for j in range(c.chunk_len):
+            for j in range(len(c.token_ids)):
                 local_pos.append(j if ci in doc_idx else -1)
         local_pos = np.array(local_pos)
 
