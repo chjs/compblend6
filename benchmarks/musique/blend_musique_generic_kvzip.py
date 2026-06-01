@@ -201,10 +201,12 @@ def _entry_chunk(cmp: CompressedChunk) -> Chunk:
                  chunk_id=cmp.chunk_id)
 
 
-def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="check_layer"):
+def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="check_layer", prune=0.0):
+    # for prune selectors, recompute_ratio is the HKVD PRE-SELECT (rr + prune); dropping the
+    # lowest-importance `prune` fraction yields final recompute = rr. prune=0 → no change.
     cfg = CompBlendConfig(
-        check_layer=CHECK_LAYER, recompute_ratio=recompute_ratio, selector=selector,
-        gate_percentile=GATE_PCT, importance_aggregation=agg,
+        check_layer=CHECK_LAYER, recompute_ratio=recompute_ratio + prune, selector=selector,
+        gate_percentile=GATE_PCT, importance_prune_ratio=prune, importance_aggregation=agg,
         deep_layer_lo=DEEP_LO, deep_layer_hi=DEEP_HI, chunk_normalization="rank")
     flags: dict = {}
     out = fuse_selective_compblend(lw, chunks, kv_store, cfg,
@@ -229,19 +231,24 @@ def main() -> int:
     print(f"[kvzip] {len(eval_dataset)} examples", flush=True)
 
     # score accumulators
-    # blending arms: (name, selector, importance_aggregation). mean vs MAX gate aggregation.
+    # blending arms: (name, selector, importance_aggregation, prune_ratio).
+    # prune arms = HKVD pre-select (rr + prune) then drop the lowest-importance `prune`
+    # fraction → final recompute = rr (matches the other arms for a fair comparison).
+    PRUNE = 0.05
     BLEND_ARMS = [
-        ("only_hkvd",          "hkvd_only",   "check_layer"),
-        ("gated_all_hkvd",     "gated_top_k", "all_layer"),       # mean over (layer,head)
-        ("gated_all_max_hkvd", "gated_top_k", "all_layer_max"),   # MAX over (layer,head)
-        ("gated_deep_hkvd",    "gated_top_k", "deep"),            # mean over deep layers,head
-        ("gated_deep_max_hkvd","gated_top_k", "deep_max"),        # MAX over deep layers,head
+        ("only_hkvd",           "hkvd_only",           "check_layer",   0.0),
+        ("gated_all_hkvd",      "gated_top_k",         "all_layer",     0.0),    # mean over (layer,head)
+        ("gated_all_max_hkvd",  "gated_top_k",         "all_layer_max", 0.0),    # MAX over (layer,head)
+        ("gated_deep_hkvd",     "gated_top_k",         "deep",          0.0),    # mean over deep,head
+        ("gated_deep_max_hkvd", "gated_top_k",         "deep_max",      0.0),    # MAX over deep,head
+        ("hkvd_prune",          "hkvd_then_imp_prune", "check_layer",   PRUNE),  # HKVD 20% → drop low-imp → 15%
+        ("hkvd_prune_max",      "hkvd_then_imp_prune", "all_layer_max", PRUNE),  # same, MAX-importance prune
     ]
     f1 = {"full_prefill": [], "full_reuse": []}
     for r in KVZIP_RATIOS:
         f1[f"full_reuse_kvzip@{r}"] = []
         for rr in RECOMP_RATIOS:
-            for arm, _s, _a in BLEND_ARMS:
+            for arm, _s, _a, _p in BLEND_ARMS:
                 f1[f"{arm}@kv{r}_rc{rr}"] = []
     fb_total = 0
 
@@ -299,8 +306,8 @@ def main() -> int:
 
             # blending arms over recompute ratios
             for rr in RECOMP_RATIOS:
-                for arm, sel, agg in BLEND_ARMS:
-                    out, fb = _run_compblend(lw, pchunks, kv_r, sel, rr, agg=agg)
+                for arm, sel, agg, prune in BLEND_ARMS:
+                    out, fb = _run_compblend(lw, pchunks, kv_r, sel, rr, agg=agg, prune=prune)
                     fb_total += fb
                     res = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device)
                     f1[f"{arm}@kv{r}_rc{rr}"].append(max(compute_f1(res, a, tokenizer) for a in answers))
@@ -327,7 +334,7 @@ def main() -> int:
     for r in KVZIP_RATIOS:
         print(f"\n kvzip_ratio={r}:  reuse_kvzip={means[f'full_reuse_kvzip@{r}']:.4f}", flush=True)
         for rr in RECOMP_RATIOS:
-            row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.3f}" for arm, _s, _a in BLEND_ARMS)
+            row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.3f}" for arm, _s, _a, _p in BLEND_ARMS)
             print(f"    rc={rr}:  {row}", flush=True)
     print(f"\n[kvzip] wrote {OUT}", flush=True)
     print("BLEND_MUSIQUE_KVZIP_DONE", flush=True)
