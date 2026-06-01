@@ -111,6 +111,12 @@ def _spearman(x, y):
     return float((rx * ry).sum() / d) if d > 0 else np.nan
 
 
+def _rank01(mat):
+    """[seq, H] → per-head (column) rank across tokens, scaled to [0, 1]."""
+    seq = mat.shape[0]
+    return mat.argsort(0).argsort(0).astype(np.float64) / max(seq - 1, 1)
+
+
 def _head_agg(mat, mode):
     """Combine a [seq, H] per-(token,head) matrix into a [seq] per-token vector.
 
@@ -171,6 +177,12 @@ def main() -> int:
     viz_examples = []                 # per-question per-token arrays for overlay plots
     pool = {"D": [], "imp3": [], "imp4": []}   # mid-layer pooled points for scatter
     viz_layers = None
+    # GLOBAL rank-MAX over (layer, head): per token, "salient/needs-recompute in ANY (layer,head)".
+    gacc = {"sp_gD_g3": [], "sp_gD_g4": [], "sp_g3_g4": []}
+    for f in TOPK:
+        gacc[f"ov{int(f*100)}_gD_g3"] = []
+        gacc[f"ov{int(f*100)}_gD_g4"] = []
+    gpool = {"D": [], "imp3": [], "imp4": []}
 
     for qi, ex in enumerate(data):
         doc_prompts, q_prompt = build_qa_prompt(ex, QUERY_PROMPT)
@@ -193,6 +205,7 @@ def main() -> int:
         viz_this = (qi < N_VIZ)
         if viz_this:
             viz_examples.append({"q": qi, "boundaries": boundaries, "layers": {}})
+        gD = np.zeros(seq); g3 = np.zeros(seq); g4 = np.zeros(seq)   # running rank-max over (layer,head)
 
         # per-chunk local-position index for each fused token (for sink buckets); -1 = non-doc
         local_pos = []
@@ -213,6 +226,10 @@ def main() -> int:
             D = _head_agg(Dmat, HEAD_NORM)                         # [seq] per-token (head-combined)
             imp3 = _head_agg(imp3mat, HEAD_NORM)
             imp4 = _head_agg(imp4mat, HEAD_NORM)
+            # global rank-MAX over (layer, head): max of this layer's per-head ranks into the running max
+            gD = np.maximum(gD, _rank01(Dmat).max(1))
+            g3 = np.maximum(g3, _rank01(imp3mat).max(1))
+            g4 = np.maximum(g4, _rank01(imp4mat).max(1))
             acc["sp_D_imp3"][L].append(_spearman(D, imp3))
             acc["sp_D_imp4"][L].append(_spearman(D, imp4))
             acc["sp_imp3_imp4"][L].append(_spearman(imp3, imp4))
@@ -236,9 +253,18 @@ def main() -> int:
                     v = a[local_pos >= 5]
                     if len(v):
                         pos_buckets[key]["rest"].append(float(v.mean()))
+        # per-question global (layer+head rank-max) metrics
+        gacc["sp_gD_g3"].append(_spearman(gD, g3)); gacc["sp_gD_g4"].append(_spearman(gD, g4))
+        gacc["sp_g3_g4"].append(_spearman(g3, g4))
+        for f in TOPK:
+            gacc[f"ov{int(f*100)}_gD_g3"].append(_overlap(gD, g3, f))
+            gacc[f"ov{int(f*100)}_gD_g4"].append(_overlap(gD, g4, f))
+        if len(gpool["D"]) < 80000:
+            gpool["D"].extend(gD.tolist()); gpool["imp3"].extend(g3.tolist()); gpool["imp4"].extend(g4.tolist())
         if (qi + 1) % 10 == 0 or qi == 0:
             print(f"[{qi+1}/{len(data)}] L{n_layers//2}: sp(D,imp3)={np.nanmean(acc['sp_D_imp3'][n_layers//2]):.3f} "
-                  f"sp(D,imp4)={np.nanmean(acc['sp_D_imp4'][n_layers//2]):.3f}", flush=True)
+                  f"sp(D,imp4)={np.nanmean(acc['sp_D_imp4'][n_layers//2]):.3f} | "
+                  f"GLOBAL sp(gD,g3)={np.nanmean(gacc['sp_gD_g3']):.3f} sp(gD,g4)={np.nanmean(gacc['sp_gD_g4']):.3f}", flush=True)
 
     def per_layer(key):
         return [float(np.nanmean(acc[key][L])) for L in range(n_layers)]
@@ -248,6 +274,7 @@ def main() -> int:
                           "note": "compressed at ratio=1.0 (clean K/scores); 50% applied as analysis threshold"},
                "per_layer": {k: per_layer(k) for k in acc},
                "layer_mean": {k: float(np.nanmean([np.nanmean(acc[k][L]) for L in range(n_layers)])) for k in acc},
+               "global_rankmax": {k: float(np.nanmean(v)) for k, v in gacc.items()},
                "intra_chunk_pos_zscore": {k: {str(p): (float(np.nanmean(v)) if v else None)
                                               for p, v in pos_buckets[k].items()} for k in pos_buckets}}
     OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -298,11 +325,24 @@ def main() -> int:
         axc.set_xlabel("layer"); axc.set_ylabel("Spearman ρ"); axc.legend()
         axc.set_title("Does KVzip importance predict reuse error D, by layer?")
         fig.tight_layout(); fig.savefig(VIZ_DIR / "per_layer_spearman.png", dpi=110); plt.close(fig)
+
+        # 4) GLOBAL rank-max scatter: imp(any layer,head) vs D(any layer,head)
+        gDp = np.array(gpool["D"]); g3p = np.array(gpool["imp3"]); g4p = np.array(gpool["imp4"])
+        fig, axs = plt.subplots(1, 2, figsize=(11, 5), sharey=True)
+        for axx, gg, name in ((axs[0], g3p, "imp3 (full-context)"), (axs[1], g4p, "imp4 (per-chunk)")):
+            axx.scatter(gg, gDp, s=2, alpha=0.12, color="C2", edgecolors="none")
+            axx.set_xlabel(f"{name} global rank-max importance"); axx.set_title(f"{name}\nSpearman = {_spearman(gg, gDp):+.3f}")
+        axs[0].set_ylabel("D global rank-max (reuse error)")
+        fig.suptitle(f"GLOBAL rank-MAX over (layer, head) — pooled over {len(data)} questions")
+        fig.tight_layout(); fig.savefig(VIZ_DIR / "scatter_global_rankmax.png", dpi=110); plt.close(fig)
         print(f"[imp_vs_reuse] wrote plots to {VIZ_DIR}", flush=True)
     except Exception as exc:
         print(f"[imp_vs_reuse] viz skipped: {type(exc).__name__}: {exc}", flush=True)
 
     print("\n──────── importance vs reuse-error (D = ||K1-K2||) ────────", flush=True)
+    print(f"GLOBAL rank-MAX over (layer,head)  [head_norm={HEAD_NORM} for per-layer below]:", flush=True)
+    for k, v in summary["global_rankmax"].items():
+        print(f"   {k:16s} {v:+.3f}", flush=True)
     print("layer-mean Spearman / overlap:", flush=True)
     for k, v in summary["layer_mean"].items():
         print(f"   {k:16s} {v:+.3f}", flush=True)
