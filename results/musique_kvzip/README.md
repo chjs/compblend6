@@ -58,3 +58,27 @@ for every recompute ratio (rc).
 
 *Caveat:* MuSiQue 5-word-answer token-F1 is inherently low (~0.2–0.3); the relative ordering is
 the signal. Single run.
+
+---
+
+## Update (2026-06-02): mean vs MAX gate vs hkvd_prune — 7 arms (N=150)
+
+`n150_7arm_2026-06-02.json`. Roofline full_prefill = 0.307, full_reuse = 0.195. Per-arm mean over
+all 20 cells (kvzip {0.5..0.1} × recompute {0.2,0.15,0.1,0.05}), Δ vs only_hkvd:
+
+| arm | F1 | Δ vs only_hkvd |
+|---|---|---|
+| only_hkvd | 0.1891 | (baseline) |
+| gated_all (mean) | 0.1914 | +0.0022 |
+| gated_all_**max** | 0.1842 | **−0.0049** |
+| gated_deep (mean) | 0.1894 | +0.0002 |
+| gated_deep_**max** | 0.1867 | **−0.0025** |
+| hkvd_prune (HKVD 20%→drop low-imp→15%) | 0.1871 | −0.0020 |
+| hkvd_prune_max | 0.1874 | −0.0017 |
+
+**Verdict:** no arm beats only-HKVD beyond noise (best +0.0022 ≪ ±0.04 cross-run drift). **MAX
+importance aggregation slightly HURTS** — it fixed the diagnostic importance↔D correlation sign
+(see `../imp_vs_reuse/`) but did not translate to F1, because a gate only restricts HKVD's candidate
+set, and importance ≈ uncorrelated with reuse-need. `hkvd_prune` ≈ only-HKVD here (it won earlier in
+the r=0.10 pair-level design sweep — regime-dependent). "Importance gate ≈ noise" is confirmed from
+both the mechanism and downstream F1.
