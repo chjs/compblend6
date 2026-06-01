@@ -352,6 +352,23 @@ def main() -> int:
 
     # ── aggregate ──
     means = {k: float(np.mean(v)) for k, v in f1.items() if v}
+
+    # paired bootstrap 95% CI of (arm − only_hkvd), per-question delta averaged over all cells
+    cells = [(r, rr) for r in KVZIP_RATIOS for rr in RECOMP_RATIOS]
+    rng = np.random.default_rng(0)
+
+    def _bootci(arm, ref="only_hkvd", iters=2000):
+        A = np.array([f1[f"{arm}@kv{r}_rc{rr}"] for r, rr in cells])      # [cells, nq]
+        B = np.array([f1[f"{ref}@kv{r}_rc{rr}"] for r, rr in cells])
+        perq = (A - B).mean(0)                                            # [nq]
+        n = len(perq)
+        bs = np.array([perq[rng.integers(0, n, n)].mean() for _ in range(iters)])
+        lo, hi = np.quantile(bs, [0.025, 0.975])
+        return {"mean": float(perq.mean()), "ci_95": [float(lo), float(hi)],
+                "significant": bool(lo > 0 or hi < 0)}
+
+    boot = {arm: _bootci(arm) for arm, _s, _a, _p in BLEND_ARMS if arm != "only_hkvd"}
+
     summary = {
         "config": {"model": MODEL, "n": len(eval_dataset), "check_layer": CHECK_LAYER,
                    "kvzip_ratios": KVZIP_RATIOS, "recompute_ratios": RECOMP_RATIOS,
@@ -359,6 +376,7 @@ def main() -> int:
                    "max_new_tokens": MAX_NEW_TOKENS, "metric": "token_f1",
                    "per_head_mask_fallback_total": fb_total},
         "f1_mean": means,
+        "bootstrap_vs_only_hkvd": boot,
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, indent=2))
@@ -369,6 +387,10 @@ def main() -> int:
         for rr in RECOMP_RATIOS:
             row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.3f}" for arm, _s, _a, _p in BLEND_ARMS)
             print(f"    rc={rr}:  {row}", flush=True)
+    print("\n──────── bootstrap 95% CI of Δ vs only_hkvd (paired over questions) ────────", flush=True)
+    for arm, v in boot.items():
+        sig = "★" if v["significant"] else " "
+        print(f"  {sig} {arm:22s} Δ={v['mean']:+.4f}  CI[{v['ci_95'][0]:+.4f},{v['ci_95'][1]:+.4f}]", flush=True)
     print(f"\n[kvzip] wrote {OUT}", flush=True)
     print("BLEND_MUSIQUE_KVZIP_DONE", flush=True)
     return 0
