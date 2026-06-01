@@ -83,6 +83,12 @@ class CompBlendConfig:
     deep_layer_lo: int | None = None
     deep_layer_hi: int | None = None
 
+    # How HKVD deviation is reduced over heads into a per-token score. "sum" (default,
+    # v7) = sum of squared (K_fresh−K_cached) over all heads*dims (additive — many
+    # moderate heads can outrank one large head). "max" = per-head SSE then MAX over
+    # heads ("needs recompute in ANY head"), catching single-head-critical reuse errors.
+    hkvd_head_reduce: str = "sum"
+
     # Exempt structural (window / sink) tokens from selector pressure.
     # When True and a backend marks `is_structural[p] = True`, that position
     # is never returned as a selected token. Its cached K/V stays in use.

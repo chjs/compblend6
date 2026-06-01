@@ -110,6 +110,8 @@ KVZIP_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_KVZIP_RATIOS", "0.5,
 RECOMP_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_RECOMP_RATIOS", "0.2,0.15,0.1,0.05").split(",") if x.strip()]
 GATE_PCT = float(os.environ.get("COMPBLEND_GATE_PCT", "0.5"))
 BUDGET_MODE = os.environ.get("COMPBLEND_BUDGET_MODE", "per_chunk")   # per_chunk | global
+COMPRESS_MODE = os.environ.get("COMPBLEND_COMPRESS_MODE", "token_prune")  # token_prune | pair_level
+HKVD_REDUCE = os.environ.get("COMPBLEND_HKVD_REDUCE", "sum")         # sum | max (per-head HKVD)
 DEEP_LO = int(os.environ.get("COMPBLEND_DEEP_LO", "15"))
 DEEP_HI = int(os.environ.get("COMPBLEND_DEEP_HI", "31"))
 OUT = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "blend_musique_kvzip.json")))
@@ -202,6 +204,25 @@ def _token_prune(cmp: CompressedChunk, keep_ratio: float) -> CompressedChunk:
     return _subset_chunk(cmp, keep)
 
 
+def _derive_valid_mask_pair(importance, target_ratio: float):
+    """KVzip pair-level threshold: keep the global top `target_ratio` of (layer,head,token)
+    importance entries → per-head non-uniform valid_mask (verbatim KVzip._threshold)."""
+    if target_ratio >= 1.0:
+        return torch.ones_like(importance, dtype=torch.bool)
+    flat = importance.reshape(-1)
+    n = max(int(flat.numel() * target_ratio) - 1, 0)
+    thres = torch.sort(flat, descending=True).values[n].item()
+    return importance > thres
+
+
+def _pair_level_entry(cmp: CompressedChunk, keep_ratio: float) -> dict:
+    """PAIR-LEVEL (per-head) compression: keep ALL tokens, but valid_mask evicts
+    different (layer,head,token) pairs per head. No token dropping (head-uniform)."""
+    entry = to_kvstore_entry(cmp)
+    entry["valid_mask"] = _derive_valid_mask_pair(cmp.importance, keep_ratio)
+    return entry
+
+
 def _global_budget_prune(cmps: list, keep_ratio: float) -> list:
     """GLOBAL budget across doc chunks: pool all doc tokens, keep the global top
     (keep_ratio × total) by importance — high-importance chunks get more tokens,
@@ -230,7 +251,8 @@ def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="chec
     cfg = CompBlendConfig(
         check_layer=CHECK_LAYER, recompute_ratio=recompute_ratio + prune, selector=selector,
         gate_percentile=GATE_PCT, importance_prune_ratio=prune, importance_aggregation=agg,
-        deep_layer_lo=DEEP_LO, deep_layer_hi=DEEP_HI, chunk_normalization="rank")
+        deep_layer_lo=DEEP_LO, deep_layer_hi=DEEP_HI, hkvd_head_reduce=HKVD_REDUCE,
+        chunk_normalization="rank")
     flags: dict = {}
     out = fuse_selective_compblend(lw, chunks, kv_store, cfg,
                                    return_layerwise_output=True, flags=flags)
@@ -310,24 +332,35 @@ def main() -> int:
 
         # ---- per kvzip ratio: token-prune doc chunks ----
         for r in KVZIP_RATIOS:
-            # compress doc chunks at keep-ratio r: PER-CHUNK (uniform) or GLOBAL budget.
-            doc_cmps = [cmp_full[chunks[ci].chunk_id] for ci in range(doc_slice.start, doc_slice.stop)]
-            if BUDGET_MODE == "global":
-                doc_pruned = _global_budget_prune(doc_cmps, r)   # may contain None (dropped chunk)
+            if COMPRESS_MODE == "pair_level":
+                # PAIR-LEVEL: keep ALL tokens, evict per-(layer,head,token) via valid_mask.
+                pchunks = []; kv_r = KVStore()
+                for ci in range(len(chunks)):
+                    cmp = cmp_full[chunks[ci].chunk_id]
+                    ch = _entry_chunk(cmp)
+                    pchunks.append(ch)
+                    if doc_slice.start <= ci < doc_slice.stop:
+                        kv_r._cache[ch.chunk_id] = _pair_level_entry(cmp, r)
+                    else:
+                        kv_r._cache[ch.chunk_id] = to_kvstore_entry(cmp)
             else:
-                doc_pruned = [_token_prune(c, r) for c in doc_cmps]
-            # assemble fused chunk list + kv store, skipping fully-dropped doc chunks
-            pchunks = []; kv_r = KVStore(); di = 0
-            for ci in range(len(chunks)):
-                if doc_slice.start <= ci < doc_slice.stop:
-                    pr = doc_pruned[di]; di += 1
-                    if pr is None:
-                        continue
+                # TOKEN-pruning compression: PER-CHUNK (uniform) or GLOBAL budget.
+                doc_cmps = [cmp_full[chunks[ci].chunk_id] for ci in range(doc_slice.start, doc_slice.stop)]
+                if BUDGET_MODE == "global":
+                    doc_pruned = _global_budget_prune(doc_cmps, r)   # may contain None
                 else:
-                    pr = cmp_full[chunks[ci].chunk_id]
-                ch = _entry_chunk(pr)
-                pchunks.append(ch)
-                kv_r._cache[ch.chunk_id] = to_kvstore_entry(pr)
+                    doc_pruned = [_token_prune(c, r) for c in doc_cmps]
+                pchunks = []; kv_r = KVStore(); di = 0
+                for ci in range(len(chunks)):
+                    if doc_slice.start <= ci < doc_slice.stop:
+                        pr = doc_pruned[di]; di += 1
+                        if pr is None:
+                            continue
+                    else:
+                        pr = cmp_full[chunks[ci].chunk_id]
+                    ch = _entry_chunk(pr)
+                    pchunks.append(ch)
+                    kv_r._cache[ch.chunk_id] = to_kvstore_entry(pr)
 
             # full_reuse_kvzip: reuse surviving tokens' KV, recompute=0
             out, fb = _run_compblend(lw, pchunks, kv_r, "hkvd_only", 0.0)
@@ -372,7 +405,7 @@ def main() -> int:
     summary = {
         "config": {"model": MODEL, "n": len(eval_dataset), "check_layer": CHECK_LAYER,
                    "kvzip_ratios": KVZIP_RATIOS, "recompute_ratios": RECOMP_RATIOS,
-                   "gate_percentile": GATE_PCT, "deep_band": [DEEP_LO, DEEP_HI], "budget_mode": BUDGET_MODE,
+                   "gate_percentile": GATE_PCT, "deep_band": [DEEP_LO, DEEP_HI], "budget_mode": BUDGET_MODE, "compress_mode": COMPRESS_MODE, "hkvd_reduce": HKVD_REDUCE,
                    "max_new_tokens": MAX_NEW_TOKENS, "metric": "token_f1",
                    "per_head_mask_fallback_total": fb_total},
         "f1_mean": means,

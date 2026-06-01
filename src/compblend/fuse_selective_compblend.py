@@ -742,7 +742,13 @@ def fuse_selective_compblend(
         timer.mark("check_qkv_proj")
 
         # HKVD on pre-RoPE K (RoPE preserves L2 — same result as post-RoPE).
-        deviations = kv_deviation(k_full_pre, K_stored_pre[config.check_layer])
+        if getattr(config, "hkvd_head_reduce", "sum") == "max":
+            _S = k_full_pre.shape[1]
+            _kf = k_full_pre.squeeze(0).view(_S, num_kv_heads, head_dim).float()
+            _ks = K_stored_pre[config.check_layer].squeeze(0).view(_S, num_kv_heads, head_dim).float()
+            deviations = ((_kf - _ks) ** 2).sum(dim=-1).max(dim=1).values   # per-head SSE → MAX over heads
+        else:
+            deviations = kv_deviation(k_full_pre, K_stored_pre[config.check_layer])
         timer.mark("check_hkvd_score")
         # Phase 2 diagnostic: expose per-position check-layer HKVD deviation so the
         # ablation runner can bucket it by intra-chunk position (sink-artifact test).
