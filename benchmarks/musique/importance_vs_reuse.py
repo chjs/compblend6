@@ -112,12 +112,23 @@ def _spearman(x, y):
 
 
 def _head_agg(mat, mode):
-    """Combine a [seq, H] per-(token,head) matrix into a [seq] per-token vector."""
-    if mode == "rank":
+    """Combine a [seq, H] per-(token,head) matrix into a [seq] per-token vector.
+
+    mode = [rank_]{mean|max|q90}:
+      mean → average over heads (BLURS a token critical to a single head).
+      max  → "important/needs-recompute in AT LEAST ONE head" (preserves single-head salience).
+      q90  → 90th-percentile over heads (max-like but robust to one noisy head).
+      rank_* → rank-normalize each head across tokens to [0,1] first (scale-fair), then combine.
+    """
+    base = mat
+    if mode.startswith("rank"):
         seq = mat.shape[0]
-        r = mat.argsort(0).argsort(0).astype(np.float64) / max(seq - 1, 1)   # per-head rank → [0,1]
-        return r.mean(1)
-    return mat.mean(1)
+        base = mat.argsort(0).argsort(0).astype(np.float64) / max(seq - 1, 1)
+    if "max" in mode:
+        return base.max(1)
+    if "q90" in mode:
+        return np.quantile(base, 0.9, axis=1)
+    return base.mean(1)
 
 
 def _overlap(a, b, frac):
