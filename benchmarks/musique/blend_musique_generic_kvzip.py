@@ -255,7 +255,7 @@ def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="chec
         chunk_normalization="rank")
     flags: dict = {}
     out = fuse_selective_compblend(lw, chunks, kv_store, cfg,
-                                   return_layerwise_output=True, flags=flags)
+                                   return_layerwise_output=True, last_logits_only=True, flags=flags)
     fb = int(flags.get("per_head_mask_fallback_count", 0))
     return out, fb
 
