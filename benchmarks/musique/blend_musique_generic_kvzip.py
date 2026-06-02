@@ -291,6 +291,12 @@ def main() -> int:
         ("hkvd_prune",          "hkvd_then_imp_prune", "check_layer",   PRUNE),  # HKVD 20% → drop low-imp → 15%
         ("hkvd_prune_max",      "hkvd_then_imp_prune", "all_layer_max", PRUNE),  # same, MAX-importance prune
     ]
+    # optional subset filter: COMPBLEND_ARMS="only_hkvd,gated_all_hkvd,importance_only"
+    _arms_env = os.environ.get("COMPBLEND_ARMS", "").strip()
+    if _arms_env:
+        _want = {a.strip() for a in _arms_env.split(",") if a.strip()}
+        BLEND_ARMS = [a for a in BLEND_ARMS if a[0] in _want]
+    print(f"[kvzip] arms={[a[0] for a in BLEND_ARMS]} compress={COMPRESS_MODE} hkvd_reduce={HKVD_REDUCE}", flush=True)
     f1 = {"full_prefill": [], "full_reuse": []}
     for r in KVZIP_RATIOS:
         f1[f"full_reuse_kvzip@{r}"] = []
