@@ -406,7 +406,10 @@ def main() -> int:
         return {"mean": float(perq.mean()), "ci_95": [float(lo), float(hi)],
                 "significant": bool(lo > 0 or hi < 0)}
 
-    boot = {arm: _bootci(arm) for arm, _s, _a, _p in BLEND_ARMS if arm != "only_hkvd"}
+    # bootstrap only if only_hkvd is among the run's arms (it's the reference)
+    ref_present = all(f"only_hkvd@kv{r}_rc{rr}" in f1 for r, rr in cells)
+    boot = ({arm: _bootci(arm) for arm, _s, _a, _p in BLEND_ARMS if arm != "only_hkvd"}
+            if ref_present else {})
 
     summary = {
         "config": {"model": MODEL, "n": len(eval_dataset), "check_layer": CHECK_LAYER,
@@ -416,6 +419,7 @@ def main() -> int:
                    "per_head_mask_fallback_total": fb_total},
         "f1_mean": means,
         "bootstrap_vs_only_hkvd": boot,
+        "f1_raw": {k: v for k, v in f1.items() if v},   # per-question scores → cross-run paired bootstrap
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(summary, indent=2))
