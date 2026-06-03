@@ -219,8 +219,13 @@ def hkvd_then_importance_prune(
     structural_mask: torch.Tensor | None = None,
     forced_mask: torch.Tensor | None = None,
     eligible_mask: torch.Tensor | None = None,
+    keep_low: bool = False,
 ) -> torch.Tensor:
     """HKVD-first, then importance-prune (REVERSE order of gated_top_k).
+
+    `keep_low=False` (default) keeps the HIGHEST-importance survivors of the HKVD
+    pre-select (drop lowest-imp). `keep_low=True` keeps the LOWEST-importance ones
+    (drop highest-imp) — the split-test control "HKVD-pool ∩ low-importance".
 
     Contrast with `gated_top_k` (importance gates FIRST, HKVD picks within): here
     HKVD picks the candidate set FIRST (so the highest-deviation tokens are always
@@ -272,7 +277,8 @@ def hkvd_then_importance_prune(
     keep = hkvd_sel
     if prune_k > 0 and int(hkvd_sel.numel()) > prune_k:
         n_keep = int(hkvd_sel.numel()) - prune_k
-        keep_local = torch.topk(importance_scores[hkvd_sel], k=n_keep).indices
+        imp_sel = importance_scores[hkvd_sel]
+        keep_local = torch.topk(-imp_sel if keep_low else imp_sel, k=n_keep).indices
         keep = hkvd_sel[keep_local]
 
     union = torch.cat([forced_idx, keep], dim=0).unique()

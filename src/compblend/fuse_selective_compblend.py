@@ -232,6 +232,23 @@ def _select_recompute_indices(
             eligible_mask=eligible_mask,
         )
 
+    if config.selector == "hkvd_then_imp_prune_high":
+        # SPLIT-TEST control: HKVD pre-select (recompute_k), then keep the LOW-importance
+        # survivors (drop the highest-importance prune_k). Tests whether the high-deviation
+        # but low-importance tokens contribute to the answer.
+        n_total = int(deviations.numel())
+        prune_k = int(n_total * config.importance_prune_ratio)
+        return hkvd_then_importance_prune(
+            hkvd_scores=deviations,
+            importance_scores=importance,
+            recompute_k=recompute_k,
+            prune_k=prune_k,
+            structural_mask=structural_eff,
+            forced_mask=forced_mask,
+            eligible_mask=eligible_mask,
+            keep_low=True,
+        )
+
     if config.selector == "hkvd_imp_exclude":
         # Reuse-safe: exclude the top `gate_percentile` by importance (stable tokens),
         # HKVD top-k among the remaining lower-importance pool.
