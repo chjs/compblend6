@@ -181,6 +181,30 @@ def _select_recompute_indices(
         )
         return select_topk_sorted(scores, target_k)
 
+    if config.selector in ("random", "importance_only_low"):
+        # controls: prove importance/HKVD carry real signal.
+        #   random            → uniform-random top-k (deterministic seed for reproducibility)
+        #   importance_only_low → BOTTOM-k by importance (anti-importance)
+        if config.selector == "importance_only_low":
+            scores = (-importance).clone()
+        else:
+            g = torch.Generator(device=importance.device).manual_seed(1234)
+            scores = torch.rand(importance.shape, generator=g, device=importance.device)
+        if forced_mask is not None and bool(forced_mask.any().item()):
+            scores[forced_mask] = float("inf")
+        if structural_eff is not None and bool(structural_eff.any().item()):
+            scores[structural_eff] = float("-inf")
+        if eligible_mask is not None:
+            not_eligible = (~eligible_mask) & (
+                forced_mask.logical_not() if forced_mask is not None
+                else torch.ones_like(eligible_mask))
+            scores = torch.where(not_eligible, torch.full_like(scores, float("-inf")), scores)
+        target_k = max(
+            recompute_k,
+            int(forced_mask.sum().item()) if forced_mask is not None else 0,
+        )
+        return select_topk_sorted(scores, target_k)
+
     if config.selector == "gated_top_k":
         return gated_top_k(
             hkvd_scores=deviations,

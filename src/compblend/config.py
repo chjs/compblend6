@@ -22,6 +22,8 @@ SelectorKind = Literal[
     "gated_top_k",        # paper §3 default — importance gate then HKVD top-k
     "hkvd_then_imp_prune",  # ablation — HKVD top-k FIRST, then drop lowest-importance
     "hkvd_imp_exclude",   # reuse-safe — EXCLUDE high-importance (stable) from recompute, HKVD within the rest
+    "random",             # control — recompute a RANDOM top-k (no signal); proves importance/HKVD carry signal
+    "importance_only_low",# control (anti) — recompute the LOWEST-importance top-k
 ]
 
 
@@ -115,7 +117,8 @@ class CompBlendConfig:
         if self.check_layer < 0:
             raise ValueError(f"check_layer must be >= 0, got {self.check_layer}")
         if self.selector not in ("hkvd_only", "importance_only", "gated_top_k",
-                                 "hkvd_then_imp_prune", "hkvd_imp_exclude"):
+                                 "hkvd_then_imp_prune", "hkvd_imp_exclude",
+                                 "random", "importance_only_low"):
             raise ValueError(f"unknown selector: {self.selector!r}")
         if self.chunk_normalization not in ("none", "rank"):
             raise ValueError(

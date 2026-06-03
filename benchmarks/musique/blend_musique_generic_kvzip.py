@@ -284,6 +284,8 @@ def main() -> int:
         ("only_hkvd",           "hkvd_only",           "check_layer",   0.0),
         ("importance_only",     "importance_only",     "all_layer",     0.0),  # top-k by importance, NO HKVD
         ("importance_only_max", "importance_only",     "all_layer_max", 0.0),  # top-k by MAX-agg importance
+        ("random",              "random",              "check_layer",   0.0),  # control: random top-k
+        ("anti_importance",     "importance_only_low", "all_layer",     0.0),  # control: bottom-k importance
         ("gated_all_hkvd",      "gated_top_k",         "all_layer",     0.0),    # mean over (layer,head)
         ("gated_all_max_hkvd",  "gated_top_k",         "all_layer_max", 0.0),    # MAX over (layer,head)
         ("gated_deep_hkvd",     "gated_top_k",         "deep",          0.0),    # mean over deep,head
