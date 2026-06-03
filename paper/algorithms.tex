@@ -1,0 +1,48 @@
+% Requires: \usepackage{algorithm} \usepackage{algpseudocode}  (or algpseudocodex)
+\begin{algorithm}[t]
+\caption{Importance-Guided Blending (online, per query)}\label{alg:blend}
+\begin{algorithmic}[1]
+\Require chunks $c_{1..m}$ with cached entries $E_c=(K^c,V^c,M^c,I^c)$ (pre-RoPE $K/V$, valid\_mask, importance);
+         check layer $\ell$, recompute ratio $\rho$, selector $\in\{\textsc{Hkvd},\textsc{Gated},\textsc{Fdi}\}$, gate pct $g$
+\Ensure blended KV cache for the fused prompt; first-token logits
+\State $X \gets \mathrm{concat}(\text{token\_ids of }c_{1..m})$ \Comment{$|X|=N$, positions $0..N{-}1$}
+\For{layer $j$}\State assemble $K_{\mathrm{cache}}[j],V_{\mathrm{cache}}[j]$ from $\{E_c\}$ at fused positions;
+\State $\mathit{valid}[j]\gets\mathrm{concat}\,M^c[j]$;\quad $\mathit{imp}[j]\gets\mathrm{concat}\,I^c[j]$ \EndFor
+\State $h\gets\mathrm{Embed}(X)$
+\For{$j=0$ \textbf{to} $\ell-1$}\State $h\gets\mathrm{Layer}_j(h)$ \Comment{dense prefill up to check layer}\EndFor
+\State $K_{\mathrm{fresh}}\gets W_k^{\ell}(\mathrm{LN}(h))$ \Comment{fresh pre-RoPE $K$ at layer $\ell$, all tokens}
+\State $D(t)\gets\sum_{\mathrm{feat}}\big(K_{\mathrm{fresh}}-K_{\mathrm{cache}}[\ell]\big)^2$ \Comment{HKVD deviation (token-level)}
+\State $\widehat I(t)\gets\mathrm{AGG}_{\mathrm{layers,heads}}\,\mathit{imp}(t)$ \Comment{per-token importance (all-layer mean)}
+\State $k\gets\lceil\rho N\rceil$
+\If{selector $=\textsc{Hkvd}$} $S\gets\mathrm{top}_k\,D$
+\ElsIf{selector $=\textsc{Gated}$} $C\gets\mathrm{top}_{gN}\,\widehat I$;\; $S\gets\mathrm{top}_k\{D(t):t\in C\}$
+\ElsIf{selector $=\textsc{Fdi}$} $S\gets\mathrm{top}_k\,\widehat I$ \Comment{importance-only, no $D$ (our best)}
+\EndIf
+\State $S\gets S\cup\{N{-}1\}$ \Comment{force last position for decoding}
+\For{$j=\ell$ \textbf{to} $L-1$} \Comment{sparse layers}
+  \For{$t\in S$}\State recompute fresh $K[j,t],V[j,t]$ (forward position $t$, all heads)\EndFor
+  \For{$t\notin S$}\State $K[j,t]\gets\mathrm{RoPE}(K^c[j,t],\,t)$;\quad $V[j,t]\gets V^c[j,t]$\EndFor
+  \State attention with per-head mask $\mathit{valid}[j]$ \Comment{evicted $(h,t)$ pairs masked out}
+\EndFor
+\State \Return $\mathrm{logits}[N{-}1]$, KV cache
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Compression-Backend Integration}\label{alg:backend}
+\begin{algorithmic}[1]
+\Statex \textbf{(A) Contract that every backend implements}
+\Statex \quad $\textsc{CompressionBackend}.\textsc{compress}(\mathit{ids},\mathit{model},\mathit{budget})\rightarrow\textsc{CompressedChunk}$
+\Statex \quad $\textsc{CompressedChunk}=\{\text{token\_ids},\,K[L],V[L]\,(\text{pre-RoPE}),\,\mathit{valid}[L,H,len],\,I[L,H,len],\,\text{is\_structural}\}$
+\Statex \textbf{(B) Offline: compress each unique chunk once, cache by hash}
+\For{each unique chunk $c$}
+  \State $\mathit{cmp}\gets\text{backend}.\textsc{compress}(c.\mathit{ids},\mathit{model},\mathit{budget})$
+  \State \textbf{assert} $\mathit{cmp}.\mathit{ids}=c.\mathit{ids}$ \Comment{tokenization-drift guard}
+  \State $\mathit{key}\gets\mathrm{hash}(c.\text{text},c.\mathit{ids},\text{algo\_id},\text{model\_id},\text{tokenizer\_id})$
+  \State $\textsc{KVStore}[\mathit{key}]\gets\textsc{ToEntry}(\mathit{cmp})$ \Comment{$\{K,V,\mathit{valid},I,\dots\}$}
+\EndFor
+\Statex \textbf{(C) Online:} the blender (Alg.~\ref{alg:blend}) consumes only these entries --- backend-agnostic.
+\Statex \textit{Field mapping:} eviction backends (KVzip/H2O/SnapKV) set $\mathit{valid}$=retained pairs, $I$=their salience;
+\Statex \quad quantization backends (KIVI) set $\mathit{valid}{=}\textsc{True}$ and require an added precision field (interface extension).
+\end{algorithmic}
+\end{algorithm}
