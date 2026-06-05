@@ -52,6 +52,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -109,6 +110,10 @@ MAX_NEW_TOKENS = 32
 KVZIP_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_KVZIP_RATIOS", "0.5,0.4,0.3,0.2,0.1").split(",") if x.strip()]
 RECOMP_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_RECOMP_RATIOS", "0.2,0.15,0.1,0.05").split(",") if x.strip()]
 GATE_PCT = float(os.environ.get("COMPBLEND_GATE_PCT", "0.5"))
+# Gate-ratio SWEEP grid (retained-set basis). Used only by gated (sel=gated_top_k) arms:
+# for each recompute ratio rr the gated arm runs at every gate g in GATE_RATIOS with g >= rr,
+# plus the two endpoint gates g=1.0 (≡ only_hkvd) and g=rr (≡ importance_only). Empty → no sweep.
+GATE_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_GATE_RATIOS", "").split(",") if x.strip()]
 BUDGET_MODE = os.environ.get("COMPBLEND_BUDGET_MODE", "per_chunk")   # per_chunk | global
 COMPRESS_MODE = os.environ.get("COMPBLEND_COMPRESS_MODE", "token_prune")  # token_prune | pair_level
 HKVD_REDUCE = os.environ.get("COMPBLEND_HKVD_REDUCE", "sum")         # sum | max (per-head HKVD)
@@ -245,12 +250,13 @@ def _entry_chunk(cmp: CompressedChunk) -> Chunk:
                  chunk_id=cmp.chunk_id)
 
 
-def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="check_layer", prune=0.0):
+def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="check_layer", prune=0.0, gate=None):
     # for prune selectors, recompute_ratio is the HKVD PRE-SELECT (rr + prune); dropping the
     # lowest-importance `prune` fraction yields final recompute = rr. prune=0 → no change.
+    # `gate` overrides the gate percentile for this single call (gate-ratio sweep); None → GATE_PCT.
     cfg = CompBlendConfig(
         check_layer=CHECK_LAYER, recompute_ratio=recompute_ratio + prune, selector=selector,
-        gate_percentile=GATE_PCT, importance_prune_ratio=prune, importance_aggregation=agg,
+        gate_percentile=(GATE_PCT if gate is None else gate), importance_prune_ratio=prune, importance_aggregation=agg,
         deep_layer_lo=DEEP_LO, deep_layer_hi=DEEP_HI, hkvd_head_reduce=HKVD_REDUCE,
         chunk_normalization="rank")
     flags: dict = {}
@@ -300,13 +306,17 @@ def main() -> int:
     if _arms_env:
         _want = {a.strip() for a in _arms_env.split(",") if a.strip()}
         BLEND_ARMS = [a for a in BLEND_ARMS if a[0] in _want]
-    print(f"[kvzip] arms={[a[0] for a in BLEND_ARMS]} compress={COMPRESS_MODE} hkvd_reduce={HKVD_REDUCE}", flush=True)
-    f1 = {"full_prefill": [], "full_reuse": []}
-    for r in KVZIP_RATIOS:
-        f1[f"full_reuse_kvzip@{r}"] = []
-        for rr in RECOMP_RATIOS:
-            for arm, _s, _a, _p in BLEND_ARMS:
-                f1[f"{arm}@kv{r}_rc{rr}"] = []
+    print(f"[kvzip] arms={[a[0] for a in BLEND_ARMS]} compress={COMPRESS_MODE} hkvd_reduce={HKVD_REDUCE} gate_ratios={GATE_RATIOS or [GATE_PCT]}", flush=True)
+
+    def _gates_for(rr):
+        """Gate ratios to run for recompute ratio rr (retained basis), if sweeping.
+        Includes the two endpoints g=1.0 (≡only_hkvd) and g=rr (≡importance_only) and
+        every grid gate >= rr (gate pool must be >= what we draw)."""
+        if not GATE_RATIOS:
+            return [GATE_PCT]
+        return sorted({g for g in GATE_RATIOS if g >= rr} | {1.0, float(rr)}, reverse=True)
+
+    f1 = defaultdict(list)
     fb_total = 0
 
     for qi, ex in enumerate(eval_dataset):
@@ -382,38 +392,75 @@ def main() -> int:
 
             # blending arms over recompute ratios
             for rr in RECOMP_RATIOS:
-                for arm, sel, agg, prune in BLEND_ARMS:
-                    out, fb = _run_compblend(lw, pchunks, kv_r, sel, rr, agg=agg, prune=prune)
+                # recompute=1.0 is trivial (all retained recomputed → every method identical);
+                # run it ONCE as the per-kvzip oracle ceiling, no gate sweep, no per-arm repeat.
+                if rr >= 1.0:
+                    out, fb = _run_compblend(lw, pchunks, kv_r, "hkvd_only", rr)
                     fb_total += fb
                     res = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device)
-                    f1[f"{arm}@kv{r}_rc{rr}"].append(max(compute_f1(res, a, tokenizer) for a in answers))
+                    f1[f"oracle@kv{r}"].append(max(compute_f1(res, a, tokenizer) for a in answers))
                     del out
                     if device.type == "cuda": torch.cuda.empty_cache()
+                    continue
+                for arm, sel, agg, prune in BLEND_ARMS:
+                    if sel == "gated_top_k" and GATE_RATIOS:
+                        # gate-ratio sweep: one cell per gate g, keyed ..._g{g}.
+                        for g in _gates_for(rr):
+                            out, fb = _run_compblend(lw, pchunks, kv_r, sel, rr, agg=agg, prune=prune, gate=g)
+                            fb_total += fb
+                            res = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device)
+                            f1[f"{arm}@kv{r}_rc{rr}_g{g}"].append(max(compute_f1(res, a, tokenizer) for a in answers))
+                            del out
+                            if device.type == "cuda": torch.cuda.empty_cache()
+                    else:
+                        out, fb = _run_compblend(lw, pchunks, kv_r, sel, rr, agg=agg, prune=prune)
+                        fb_total += fb
+                        res = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device)
+                        f1[f"{arm}@kv{r}_rc{rr}"].append(max(compute_f1(res, a, tokenizer) for a in answers))
+                        del out
+                        if device.type == "cuda": torch.cuda.empty_cache()
         if (qi + 1) % 10 == 0 or qi == 0:
             print(f"[{qi+1}/{len(eval_dataset)}] full_prefill={np.mean(f1['full_prefill']):.3f} "
                   f"full_reuse={np.mean(f1['full_reuse']):.3f} fb={fb_total}", flush=True)
+        # periodic checkpoint (long gate-sweep runs): dump partial raw scores so an
+        # interruption doesn't lose hours of compute. Atomic-ish via temp + replace.
+        if (qi + 1) % 20 == 0:
+            try:
+                OUT.parent.mkdir(parents=True, exist_ok=True)
+                ckpt = {"_partial_after_q": qi + 1, "f1_raw": {k: v for k, v in f1.items() if v}}
+                tmp = OUT.with_suffix(OUT.suffix + ".ckpt.tmp")
+                tmp.write_text(json.dumps(ckpt))
+                tmp.replace(OUT.with_suffix(OUT.suffix + ".ckpt"))
+            except Exception as _e:
+                print(f"[ckpt] skip: {type(_e).__name__}: {_e}", flush=True)
 
     # ── aggregate ──
     means = {k: float(np.mean(v)) for k, v in f1.items() if v}
 
-    # paired bootstrap 95% CI of (arm − only_hkvd), per-question delta averaged over all cells
-    cells = [(r, rr) for r in KVZIP_RATIOS for rr in RECOMP_RATIOS]
+    # paired bootstrap 95% CI of (arm − only_hkvd) — BEST-EFFORT over plain-key arms only
+    # (recompute<1.0 cells; gate-sweep per-gate cells are analysed offline from f1_raw).
+    plain_cells = [(r, rr) for r in KVZIP_RATIOS for rr in RECOMP_RATIOS if rr < 1.0]
     rng = np.random.default_rng(0)
 
     def _bootci(arm, ref="only_hkvd", iters=2000):
-        A = np.array([f1[f"{arm}@kv{r}_rc{rr}"] for r, rr in cells])      # [cells, nq]
-        B = np.array([f1[f"{ref}@kv{r}_rc{rr}"] for r, rr in cells])
-        perq = (A - B).mean(0)                                            # [nq]
-        n = len(perq)
+        ka = [f"{arm}@kv{r}_rc{rr}" for r, rr in plain_cells]
+        kb = [f"{ref}@kv{r}_rc{rr}" for r, rr in plain_cells]
+        if not plain_cells or not all(f1.get(k) for k in ka + kb):
+            return None
+        A = np.array([f1[k] for k in ka]); B = np.array([f1[k] for k in kb])
+        perq = (A - B).mean(0); n = len(perq)
         bs = np.array([perq[rng.integers(0, n, n)].mean() for _ in range(iters)])
         lo, hi = np.quantile(bs, [0.025, 0.975])
         return {"mean": float(perq.mean()), "ci_95": [float(lo), float(hi)],
                 "significant": bool(lo > 0 or hi < 0)}
 
-    # bootstrap only if only_hkvd is among the run's arms (it's the reference)
-    ref_present = all(f"only_hkvd@kv{r}_rc{rr}" in f1 for r, rr in cells)
-    boot = ({arm: _bootci(arm) for arm, _s, _a, _p in BLEND_ARMS if arm != "only_hkvd"}
-            if ref_present else {})
+    boot = {}
+    for arm, _s, _a, _p in BLEND_ARMS:
+        if arm == "only_hkvd":
+            continue
+        _ci = _bootci(arm)
+        if _ci is not None:
+            boot[arm] = _ci
 
     summary = {
         "config": {"model": MODEL, "n": len(eval_dataset), "check_layer": CHECK_LAYER,
@@ -430,10 +477,26 @@ def main() -> int:
     print("\n──────── blend_musique_kvzip ────────", flush=True)
     print(f"ROOFLINE full_prefill = {means['full_prefill']:.4f}   full_reuse = {means['full_reuse']:.4f}   (fb={fb_total})", flush=True)
     for r in KVZIP_RATIOS:
-        print(f"\n kvzip_ratio={r}:  reuse_kvzip={means[f'full_reuse_kvzip@{r}']:.4f}", flush=True)
+        orc = means.get(f"oracle@kv{r}")
+        head = f"\n kvzip_ratio={r}:  reuse_kvzip={means.get(f'full_reuse_kvzip@{r}', float('nan')):.4f}"
+        if orc is not None:
+            head += f"  oracle(rc=1)={orc:.4f}"
+        print(head, flush=True)
         for rr in RECOMP_RATIOS:
-            row = "  ".join(f"{arm}={means[f'{arm}@kv{r}_rc{rr}']:.3f}" for arm, _s, _a, _p in BLEND_ARMS)
-            print(f"    rc={rr}:  {row}", flush=True)
+            if rr >= 1.0:
+                continue
+            cells_here = []
+            for arm, _s, _a, _p in BLEND_ARMS:
+                if _s == "gated_top_k" and GATE_RATIOS:
+                    for g in _gates_for(rr):
+                        k = f"{arm}@kv{r}_rc{rr}_g{g}"
+                        if k in means:
+                            cells_here.append(f"{arm}_g{g}={means[k]:.3f}")
+                else:
+                    k = f"{arm}@kv{r}_rc{rr}"
+                    if k in means:
+                        cells_here.append(f"{arm}={means[k]:.3f}")
+            print(f"    rc={rr}:  " + "  ".join(cells_here), flush=True)
     print("\n──────── bootstrap 95% CI of Δ vs only_hkvd (paired over questions) ────────", flush=True)
     for arm, v in boot.items():
         sig = "★" if v["significant"] else " "
