@@ -1,0 +1,191 @@
+{
+  "config": {
+    "model": "Qwen/Qwen2.5-14B-Instruct",
+    "n": 40,
+    "kvzip_ratios": [
+      1.0,
+      0.8,
+      0.6,
+      0.4,
+      0.3,
+      0.2,
+      0.1
+    ],
+    "layers": [
+      1,
+      24,
+      24
+    ],
+    "check_layer": 1
+  },
+  "per_kv": {
+    "1.0": {
+      "1": {
+        "n_tokens": 240480,
+        "A_benefit_hkvd": 2.712430000305176,
+        "A_benefit_random": 0.6578280329704285,
+        "A_benefit_all": 0.6472465991973877,
+        "frac_hkvd_recompute_helps": 1.0,
+        "B_corr_dev_reuse": 1.0,
+        "C_corr_dev_recompDamage": -0.9999999997517719,
+        "mean_reuse": 0.6472465991973877,
+        "mean_recomp": 0.0
+      },
+      "24": {
+        "n_tokens": 480960,
+        "A_benefit_hkvd": 2892.03857421875,
+        "A_benefit_random": 1118.7657470703125,
+        "A_benefit_all": 1113.795654296875,
+        "frac_hkvd_recompute_helps": 1.0,
+        "B_corr_dev_reuse": 1.0,
+        "C_corr_dev_recompDamage": -0.999999999736218,
+        "mean_reuse": 1113.795654296875,
+        "mean_recomp": 0.0
+      }
+    },
+    "0.8": {
+      "1": {
+        "n_tokens": 193343,
+        "A_benefit_hkvd": -6.833893299102783,
+        "A_benefit_random": -0.9316412210464478,
+        "A_benefit_all": -0.9095613956451416,
+        "frac_hkvd_recompute_helps": 0.38450398262128893,
+        "B_corr_dev_reuse": 0.618541384183173,
+        "C_corr_dev_recompDamage": -0.062115170392826685,
+        "mean_reuse": 0.6739900708198547,
+        "mean_recomp": 1.5835515260696411
+      },
+      "24": {
+        "n_tokens": 386686,
+        "A_benefit_hkvd": 848.2061767578125,
+        "A_benefit_random": 412.6813659667969,
+        "A_benefit_all": 417.77777099609375,
+        "frac_hkvd_recompute_helps": 0.7192559005568677,
+        "B_corr_dev_reuse": 0.8428035658024238,
+        "C_corr_dev_recompDamage": -0.4435433362463407,
+        "mean_reuse": 1026.171142578125,
+        "mean_recomp": 608.393310546875
+      }
+    },
+    "0.6": {
+      "1": {
+        "n_tokens": 146195,
+        "A_benefit_hkvd": -14.220946311950684,
+        "A_benefit_random": -2.39672589302063,
+        "A_benefit_all": -2.4029605388641357,
+        "frac_hkvd_recompute_helps": 0.11965889917460897,
+        "B_corr_dev_reuse": 0.3565845476913496,
+        "C_corr_dev_recompDamage": 0.47163492503996834,
+        "mean_reuse": 0.7159914374351501,
+        "mean_recomp": 3.1189520359039307
+      },
+      "24": {
+        "n_tokens": 292390,
+        "A_benefit_hkvd": -26.847736358642578,
+        "A_benefit_random": 4.774006366729736,
+        "A_benefit_all": 3.4877729415893555,
+        "frac_hkvd_recompute_helps": 0.49464179853162477,
+        "B_corr_dev_reuse": 0.693948956041872,
+        "C_corr_dev_recompDamage": -0.13828029396465885,
+        "mean_reuse": 949.8901977539062,
+        "mean_recomp": 946.4022827148438
+      }
+    },
+    "0.4": {
+      "1": {
+        "n_tokens": 99051,
+        "A_benefit_hkvd": -18.86457061767578,
+        "A_benefit_random": -4.211343288421631,
+        "A_benefit_all": -4.1466851234436035,
+        "frac_hkvd_recompute_helps": 0.05835240274599542,
+        "B_corr_dev_reuse": 0.17790691308226478,
+        "C_corr_dev_recompDamage": 0.7391706031001782,
+        "mean_reuse": 0.7842780947685242,
+        "mean_recomp": 4.930963516235352
+      },
+      "24": {
+        "n_tokens": 198102,
+        "A_benefit_hkvd": -888.919189453125,
+        "A_benefit_random": -420.31292724609375,
+        "A_benefit_all": -415.7354431152344,
+        "frac_hkvd_recompute_helps": 0.24109035840484605,
+        "B_corr_dev_reuse": 0.5389887721962271,
+        "C_corr_dev_recompDamage": 0.17213867460463,
+        "mean_reuse": 868.3866577148438,
+        "mean_recomp": 1284.1220703125
+      }
+    },
+    "0.3": {
+      "1": {
+        "n_tokens": 75490,
+        "A_benefit_hkvd": -20.21609878540039,
+        "A_benefit_random": -4.9651384353637695,
+        "A_benefit_all": -5.084288120269775,
+        "frac_hkvd_recompute_helps": 0.05731190392087602,
+        "B_corr_dev_reuse": 0.12157468862832647,
+        "C_corr_dev_recompDamage": 0.7998222610477589,
+        "mean_reuse": 0.8541695475578308,
+        "mean_recomp": 5.93845796585083
+      },
+      "24": {
+        "n_tokens": 150980,
+        "A_benefit_hkvd": -1232.0181884765625,
+        "A_benefit_random": -631.3085327148438,
+        "A_benefit_all": -630.6177978515625,
+        "frac_hkvd_recompute_helps": 0.15807833267099394,
+        "B_corr_dev_reuse": 0.48614341049098675,
+        "C_corr_dev_recompDamage": 0.30816350602136716,
+        "mean_reuse": 827.4527587890625,
+        "mean_recomp": 1458.070556640625
+      }
+    },
+    "0.2": {
+      "1": {
+        "n_tokens": 51903,
+        "A_benefit_hkvd": -20.50272560119629,
+        "A_benefit_random": -5.734327793121338,
+        "A_benefit_all": -5.837652206420898,
+        "frac_hkvd_recompute_helps": 0.06589595375722543,
+        "B_corr_dev_reuse": 0.0914443068584824,
+        "C_corr_dev_recompDamage": 0.8308461652504205,
+        "mean_reuse": 1.0003398656845093,
+        "mean_recomp": 6.837991714477539
+      },
+      "24": {
+        "n_tokens": 103806,
+        "A_benefit_hkvd": -1498.4241943359375,
+        "A_benefit_random": -837.3338012695312,
+        "A_benefit_all": -839.8571166992188,
+        "frac_hkvd_recompute_helps": 0.1111039753387708,
+        "B_corr_dev_reuse": 0.4463412494889085,
+        "C_corr_dev_recompDamage": 0.4329525142156371,
+        "mean_reuse": 790.2610473632812,
+        "mean_recomp": 1630.1181640625
+      }
+    },
+    "0.1": {
+      "1": {
+        "n_tokens": 28332,
+        "A_benefit_hkvd": -16.865116119384766,
+        "A_benefit_random": -5.60259485244751,
+        "A_benefit_all": -5.511043548583984,
+        "frac_hkvd_recompute_helps": 0.11105882352941177,
+        "B_corr_dev_reuse": 0.11935531341795533,
+        "C_corr_dev_recompDamage": 0.8134109034050704,
+        "mean_reuse": 1.4003437757492065,
+        "mean_recomp": 6.911387920379639
+      },
+      "24": {
+        "n_tokens": 56664,
+        "A_benefit_hkvd": -1625.933837890625,
+        "A_benefit_random": -957.69580078125,
+        "A_benefit_all": -968.5601196289062,
+        "frac_hkvd_recompute_helps": 0.1028235294117647,
+        "B_corr_dev_reuse": 0.44753240759907154,
+        "C_corr_dev_recompDamage": 0.5526487110847113,
+        "mean_reuse": 760.4278564453125,
+        "mean_recomp": 1728.988037109375
+      }
+    }
+  }
+}
