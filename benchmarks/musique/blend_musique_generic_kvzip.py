@@ -114,6 +114,12 @@ GATE_PCT = float(os.environ.get("COMPBLEND_GATE_PCT", "0.5"))
 # for each recompute ratio rr the gated arm runs at every gate g in GATE_RATIOS with g >= rr,
 # plus the two endpoint gates g=1.0 (≡ only_hkvd) and g=rr (≡ importance_only). Empty → no sweep.
 GATE_RATIOS = [float(x) for x in os.environ.get("COMPBLEND_GATE_RATIOS", "").split(",") if x.strip()]
+# Chunk-level importance budget allocation (orthogonal axis, idea 5):
+#   "rank" = per-chunk rank-normalize importance before concat → ~uniform recompute budget per chunk.
+#   "none" = raw importance concat → high-(raw-importance) chunks claim more of the global top-k budget
+#            = importance-weighted chunk budget. Tests whether chunk-budget reallocation helps on top of
+#            importance-only token selection.
+CHUNK_NORM = os.environ.get("COMPBLEND_CHUNK_NORM", "rank")
 BUDGET_MODE = os.environ.get("COMPBLEND_BUDGET_MODE", "per_chunk")   # per_chunk | global
 COMPRESS_MODE = os.environ.get("COMPBLEND_COMPRESS_MODE", "token_prune")  # token_prune | pair_level
 HKVD_REDUCE = os.environ.get("COMPBLEND_HKVD_REDUCE", "sum")         # sum | max (per-head HKVD)
@@ -258,7 +264,7 @@ def _run_compblend(lw, chunks, kv_store, selector, recompute_ratio, *, agg="chec
         check_layer=CHECK_LAYER, recompute_ratio=recompute_ratio + prune, selector=selector,
         gate_percentile=(GATE_PCT if gate is None else gate), importance_prune_ratio=prune, importance_aggregation=agg,
         deep_layer_lo=DEEP_LO, deep_layer_hi=DEEP_HI, hkvd_head_reduce=HKVD_REDUCE,
-        chunk_normalization="rank")
+        chunk_normalization=CHUNK_NORM)
     flags: dict = {}
     out = fuse_selective_compblend(lw, chunks, kv_store, cfg,
                                    return_layerwise_output=True, last_logits_only=True, flags=flags)
